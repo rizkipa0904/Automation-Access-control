@@ -26,7 +26,7 @@ if HAS_REPORT:
 class PlatformTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
-        self.patches = patch.multiple(app, DATA_DIR=Path(self.tmp.name) / 'data', STATE_FILE=Path(self.tmp.name) / 'data' / 'projects.json', STORAGE_ERROR=None, STORAGE_BLOCKED=False)
+        self.patches = patch.multiple(app, DATA_DIR=Path(self.tmp.name) / 'data', STATE_FILE=Path(self.tmp.name) / 'data' / 'projects.json', STORAGE_ERROR=None, STORAGE_BLOCKED=False, LAST_STATE_SAVE=0.0)
         self.patches.start()
         app.RUNS.clear(); app.PROJECTS.clear()
     def tearDown(self):
@@ -42,7 +42,7 @@ class PlatformTests(unittest.TestCase):
         handler.rfile = BytesIO(payload)
         captured = []
         handler.respond = lambda obj, status=200: captured.append((status, obj))
-        (handler.do_POST if method == 'POST' else handler.do_GET)()
+        {'POST': handler.do_POST, 'GET': handler.do_GET, 'DELETE': handler.do_DELETE}[method]()
         return captured[0]
     def project(self, name):
         status, data = self.request({'name': name}, path='/projects')
@@ -71,6 +71,69 @@ class PlatformTests(unittest.TestCase):
             self.await_done(data['id'])
         self.assertEqual(calls, [('192.0.2.1', False, 'paloalto')])
         self.assertNotIn('password', json.dumps(app.public(app.RUNS[data['id']])))
+        code, detail = self.request(path='/runs/' + data['id'], method='GET')
+        self.assertEqual(code, 200)
+        self.assertEqual({item['id'] for item in detail['results'][0]['checklist']},
+                         {f'PA-{number:02d}' for number in range(1, 7)})
+    def test_rerun_requires_completed_scan_and_new_credentials(self):
+        project = self.project('Rerun')
+        other = self.project('Other')
+        calls = []
+        def fake_collect(target, approved, cancelled, update, **kwargs):
+            calls.append((target['ip'], target['password']))
+            return {'ip': target['ip'], 'port': target['port'], 'status': 'completed', 'issues': [], 'evidence': [], 'accounts': [], 'facts': []}
+        with patch.object(app, 'collect', side_effect=fake_collect):
+            original_status, original = self.request({'project_id': project, 'platform': 'cisco', 'targets': [{'ip': '192.0.2.1', 'username': 'reader', 'password': 'first-password'}]})
+            self.assertEqual(original_status, 200)
+            self.await_done(original['id'])
+            invalid = {'project_id': other, 'platform': 'cisco', 'rerun_of': original['id'], 'targets': [{'ip': '192.0.2.1', 'username': 'reader', 'password': 'second-password'}]}
+            self.assertEqual(self.request(invalid)[0], 400)
+            invalid['project_id'] = project
+            invalid['targets'][0]['password'] = ''
+            self.assertEqual(self.request(invalid)[0], 400)
+            invalid['targets'][0]['password'] = 'second-password'
+            status, rerun = self.request(invalid)
+            self.assertEqual(status, 200)
+            self.await_done(rerun['id'])
+        self.assertEqual(calls, [('192.0.2.1', 'first-password'), ('192.0.2.1', 'second-password')])
+        self.assertEqual(app.RUNS[rerun['id']]['rerun_of'], original['id'])
+        self.assertNotIn('first-password', app.STATE_FILE.read_text())
+        self.assertNotIn('second-password', app.STATE_FILE.read_text())
+
+    def test_saved_scan_limit_and_explicit_delete(self):
+        project = self.project('Retention')
+        payload = {'project_id': project, 'platform': 'cisco', 'targets': [{'ip': '192.0.2.1', 'username': 'reader', 'password': 'password'}]}
+        def fake_collect(target, approved, cancelled, update, **kwargs):
+            return {'ip': target['ip'], 'port': target['port'], 'status': 'completed', 'issues': [], 'evidence': [], 'accounts': [], 'facts': []}
+        with patch.object(app, 'MAX_RUNS_PER_PROJECT', 2), patch.object(app, 'collect', side_effect=fake_collect):
+            ids = []
+            for _ in range(2):
+                status, result = self.request(payload)
+                self.assertEqual(status, 200)
+                ids.append(result['id'])
+                self.await_done(result['id'])
+            status, result = self.request(payload)
+            self.assertEqual(status, 400)
+            self.assertIn('saved scans', result['error'])
+            self.assertEqual(self.request(path='/runs/' + ids[0], method='DELETE', token=False)[0], 403)
+            self.assertEqual(self.request(path='/runs/' + ids[0], method='DELETE')[0], 200)
+            self.assertEqual(self.request(path='/runs/' + ids[0], method='GET')[0], 404)
+            self.assertEqual(len(app.PROJECTS[project]['runs']), 1)
+            final_status, final_run = self.request(payload)
+            self.assertEqual(final_status, 200)
+            self.await_done(final_run['id'])
+
+    def test_completed_device_clears_current_command(self):
+        project = self.project('Status')
+        def fake_collect(target, approved, cancelled, update, **kwargs):
+            update('collecting')
+            kwargs['on_event']({'type': 'command_started', 'command': 'show version'})
+            return {'ip': target['ip'], 'port': target['port'], 'status': 'completed', 'issues': [], 'evidence': [], 'accounts': [], 'facts': []}
+        with patch.object(app, 'collect', side_effect=fake_collect):
+            status, run = self.request({'project_id': project, 'platform': 'cisco', 'targets': [{'ip': '192.0.2.1', 'username': 'reader', 'password': 'password'}]})
+            self.assertEqual(status, 200)
+            self.await_done(run['id'])
+        self.assertEqual(app.RUNS[run['id']]['results'][0]['current_command'], '')
     def test_concurrent_projects_live_preview_and_persistence(self):
         a, b = self.project('A'), self.project('B')
         release = threading.Event()

@@ -122,7 +122,7 @@ tacacs server TAC-1
             BadHostKeyException = type('BadHostKeyException', (Exception,), {})
             AuthenticationException = type('AuthenticationException', (Exception,), {})
             SSHException = type('SSHException', (Exception,), {})
-        responses = iter(['switch#'] + ['username admin privilege 15 secret 9 secretvalue\nswitch#' if command == 'show running-config' else 'switch#' for command in COMMANDS])
+        responses = iter(['switch#'] + ['Cisco IOS XE Software, Version 17.9.4\nswitch#' if command == 'show version' else 'username admin privilege 15 secret 9 secretvalue\nswitch#' if command == 'show running-config' else 'switch#' for command in COMMANDS])
         events = []
         with patch.object(core, 'paramiko', FakeParamiko), patch.object(core, '_read_until_prompt', side_effect=lambda *args: next(responses)):
             result = core.collect({'ip': '192.0.2.1', 'port': 22, 'username': 'u', 'password': 'test-ssh-password'}, {}, lambda: False, lambda _: None, on_event=events.append)
@@ -134,7 +134,7 @@ tacacs server TAC-1
         self.assertEqual(result['status'], 'completed')
         self.assertNotIn('secretvalue', repr(result))
         client.channel.sent.clear()
-        responses = iter(['switch#'] * (len(COMMANDS) + 1))
+        responses = iter(['switch#', 'Cisco IOS XE Software, Version 17.9.4\nswitch#'] + ['switch#'] * (len(COMMANDS) - 1))
         with patch.object(core, 'paramiko', FakeParamiko), patch.object(core, '_read_until_prompt', side_effect=lambda *args: next(responses)):
             core.collect({'ip': '192.0.2.1', 'port': 22, 'username': 'u', 'password': 'test-ssh-password'}, {}, lambda: False, lambda _: None, legacy=True)
         self.assertEqual(client.options['disabled_algorithms'], {})
@@ -158,7 +158,7 @@ tacacs server TAC-1
             AuthenticationException = type('AuthenticationException', (Exception,), {})
             SSHException = type('SSHException', (Exception,), {})
         secret = 'TEST_CREDENTIAL_319'
-        outputs = ['switch#'] + [('username user' + secret + ' privilege 15 secret 9 otherhash\nswitch#') if c == 'show running-config' else 'switch#' for c in core.COMMANDS]
+        outputs = ['switch#'] + ['Cisco IOS XE Software, Version 17.9.4\nswitch#' if c == 'show version' else ('username user' + secret + ' privilege 15 secret 9 otherhash\nswitch#') if c == 'show running-config' else 'switch#' for c in core.COMMANDS]
         events = []
         with patch.object(core, 'paramiko', FakeParamiko), patch.object(core, '_read_until_prompt', side_effect=outputs):
             result = core.collect({'ip':'192.0.2.1', 'port':22, 'username':'u', 'password':secret}, {}, lambda:False, lambda _:None, on_event=events.append)
@@ -329,7 +329,7 @@ admin@fw>'''
             BadHostKeyException = type('BadHostKeyException', (Exception,), {})
             AuthenticationException = type('AuthenticationException', (Exception,), {})
             SSHException = type('SSHException', (Exception,), {})
-        responses = iter(['admin@fw>', 'hostname: fw\nadmin@fw>', 'admin\nadmin@fw>', '<config><secret>PRIVATE-HASH</secret>'])
+        responses = iter(['admin@fw>', 'hostname: fw\nsw-version: 11.1.3\nadmin@fw>', 'admin\nadmin@fw>', '<config><secret>PRIVATE-HASH</secret>'])
         events = []
         with patch.object(core, 'paramiko', FakeParamiko), patch.object(core, '_read_until_prompt', side_effect=lambda *args: next(responses)):
             result = core.collect({'ip': '192.0.2.1', 'port': 22, 'username': 'u', 'password': 'test-ssh-password'}, {}, lambda: False, lambda _: None, platform='paloalto', on_event=events.append)
@@ -355,3 +355,184 @@ admin@fw>'''
             result = core.collect({'ip': '192.0.2.1', 'port': 22, 'username': 'u', 'password': 'test-ssh-password'}, {}, lambda: False, lambda _: None, platform='paloalto')
         self.assertEqual(result['status'], 'failed')
         self.assertEqual(result['evidence'], [])
+
+
+class SessionCompatibilityTests(unittest.TestCase):
+    def test_pan_ha_prompt_and_terminal_decoration_are_recognized(self):
+        class Channel:
+            closed = False
+            def __init__(self, data): self.parts = [data]
+            def recv_ready(self): return bool(self.parts)
+            def recv(self, _): return self.parts.pop(0)
+        greeting = _read_until_prompt(Channel(b'\x1b[32madmin@fw(active-primary)>\x1b[0m'), 1, lambda: False, platform='paloalto')
+        self.assertEqual(greeting, 'admin@fw(active-primary)>')
+        response = _read_until_prompt(Channel(b'sw-version: 11.1.3\r\nadmin@fw(passive-secondary)>'), 1, lambda: False,
+                                      'admin@fw(active-primary)>', 'paloalto', 'show system info')
+        self.assertTrue(response.endswith('admin@fw(passive-secondary)>'))
+
+    def test_cisco_show_users_completes_with_ansi_colored_prompt(self):
+        class Channel:
+            closed = False
+            def __init__(self): self.parts = [b'show users\r\nLine User Host(s)\r\n\x1b[36mswitch#\x1b[0m']
+            def recv_ready(self): return bool(self.parts)
+            def recv(self, _): return self.parts.pop(0)
+        output = _read_until_prompt(Channel(), 1, lambda: False, 'switch#', 'cisco', 'show users')
+        self.assertTrue(output.endswith('switch#'))
+        self.assertNotIn('\x1b', output)
+
+    def test_pagination_never_sends_a_key_or_another_command(self):
+        from cisco_audit import core
+        class Channel:
+            closed = False
+            def __init__(self): self.parts = [b'show users\r\n--More--']; self.sent = []
+            def recv_ready(self): return bool(self.parts)
+            def recv(self, _): return self.parts.pop(0)
+            def sendall(self, data): self.sent.append(data)
+        channel = Channel()
+        with self.assertRaisesRegex(core.SessionSyncError, 'Paginated output'):
+            _read_until_prompt(channel, 1, lambda: False, 'switch#', 'cisco', 'show users')
+        self.assertEqual(channel.sent, [])
+
+    def test_unknown_prompt_is_reported_before_any_next_command(self):
+        from cisco_audit import core
+        class Channel:
+            closed = False
+            def __init__(self): self.parts = [b'other-switch#']
+            def recv_ready(self): return bool(self.parts)
+            def recv(self, _): return self.parts.pop(0)
+        with self.assertRaisesRegex(core.SessionSyncError, 'changed unexpectedly'):
+            _read_until_prompt(Channel(), 1, lambda: False, 'switch#', 'cisco', 'show users')
+
+    def test_show_users_timeout_names_the_command_without_raw_output(self):
+        class Channel:
+            closed = False
+            def __init__(self): self.parts = [b'show users\nPRIVATE-OUTPUT']
+            def recv_ready(self): return bool(self.parts)
+            def recv(self, _): return self.parts.pop(0)
+        with self.assertRaises(TimeoutError) as failure:
+            _read_until_prompt(Channel(), .15, lambda: False, 'switch#', 'cisco', 'show users')
+        self.assertIn('after show users', str(failure.exception))
+        self.assertNotIn('PRIVATE-OUTPUT', str(failure.exception))
+
+    def test_version_and_privilege_select_only_verified_show_commands(self):
+        from cisco_audit.core import _identity_commands
+        modern, issues = _identity_commands('cisco', 'Cisco IOS XE Software, Version 17.9.4\nswitch#', 'switch#')
+        self.assertEqual(modern, COMMANDS[1:])
+        self.assertEqual(issues, [])
+        old, issues = _identity_commands('cisco', 'Cisco IOS Software, Version 12.1(5)T\nswitch>', 'switch>')
+        self.assertNotIn('show ssh', old)
+        self.assertNotIn('show ip ssh', old)
+        self.assertNotIn('show running-config', old)
+        self.assertEqual({issue['command'] for issue in issues}, {'show ssh', 'show ip ssh', 'show running-config'})
+        classic = 'Cisco Internetwork Operating System Software\nIOS (tm) C6400 Software (C6400-M), Version 12.2(2)B2\nswitch#'
+        self.assertIn('show ssh', _identity_commands('cisco', classic, 'switch#')[0])
+        self.assertIn('Cisco IOS version: 12.2(2)B2', sanitize_show('show version', classic))
+        with self.assertRaisesRegex(ValueError, 'could not be verified'):
+            _identity_commands('cisco', 'Cisco NX-OS Software, Version 9.3(8)', 'switch#')
+        self.assertEqual(_identity_commands('paloalto', 'sw-version: 11.1.3', 'admin@fw>')[0], ('show admins all', 'show config running'))
+        with self.assertRaisesRegex(ValueError, 'could not be verified'):
+            _identity_commands('paloalto', 'sw-version: 13.0.0', 'admin@fw>')
+
+    def test_unsupported_cisco_family_stops_after_first_show(self):
+        from cisco_audit import core
+        class Channel:
+            closed = False
+            def __init__(self): self.sent = []; self.parts = [b'switch#']
+            def settimeout(self, value): pass
+            def recv_ready(self): return bool(self.parts)
+            def recv(self, _): return self.parts.pop(0)
+            def sendall(self, value):
+                self.sent.append(value)
+                self.parts = [b'Cisco NX-OS Software, Version 9.3(8)\nswitch#']
+        class Client:
+            def __init__(self): self.channel = Channel()
+            def load_system_host_keys(self): pass
+            def set_missing_host_key_policy(self, policy): pass
+            def connect(self, *args, **kwargs): pass
+            def invoke_shell(self, **kwargs): return self.channel
+            def close(self): pass
+        client = Client()
+        class FakeParamiko:
+            SSHClient = staticmethod(lambda: client)
+            MissingHostKeyPolicy = type('MissingHostKeyPolicy', (), {})
+            BadHostKeyException = type('BadHostKeyException', (Exception,), {})
+            AuthenticationException = type('AuthenticationException', (Exception,), {})
+            SSHException = type('SSHException', (Exception,), {})
+        with patch.object(core, 'paramiko', FakeParamiko):
+            result = core.collect({'ip': '192.0.2.1', 'port': 22, 'username': 'u', 'password': 'p'}, {}, lambda: False, lambda _: None)
+        self.assertEqual(client.channel.sent, ['show version\n'])
+        self.assertEqual(result['status'], 'partial')
+        self.assertIn('could not be verified', result['issues'][0]['message'])
+
+
+class ChecklistEvidenceTests(unittest.TestCase):
+    def test_cisco_access_management_and_logging_are_filtered(self):
+        config = '''enable secret 9 ENABLE_HASH_DO_NOT_EXPORT
+enable password 7 ENCRYPTED_DO_NOT_EXPORT
+line con 0
+ login authentication CONSOLE
+ exec-timeout 5 0
+line aux 0
+ transport input none
+login block-for 120 attempts 3 within 60
+login on-failure log
+ip access-list standard MGMT
+ permit 192.0.2.0 0.0.0.255
+ remark SECRET_REMARK_DO_NOT_EXPORT
+ permit object-group SECRET_OBJECT_DO_NOT_EXPORT
+ip http server
+no ip http secure-server
+ip http authentication aaa
+snmp-server community COMMUNITY_DO_NOT_EXPORT RO
+snmp-server user monitor USERS_SECRET_DO_NOT_EXPORT auth sha SECRET
+logging host 192.0.2.20
+logging trap warnings
+ntp server 192.0.2.30
+ntp authentication-key 1 md5 NTP_SECRET_DO_NOT_EXPORT
+ntp authenticate
+netconf-yang
+restconf
+'''
+        facts, _ = extract_config(config)
+        for value in ('ENABLE_HASH_DO_NOT_EXPORT', 'ENCRYPTED_DO_NOT_EXPORT',
+                      'SECRET_REMARK_DO_NOT_EXPORT', 'SECRET_OBJECT_DO_NOT_EXPORT',
+                      'COMMUNITY_DO_NOT_EXPORT', 'USERS_SECRET_DO_NOT_EXPORT',
+                      'NTP_SECRET_DO_NOT_EXPORT'):
+            self.assertNotIn(value, repr(facts))
+        for value in ('enable secret configured [value hidden]',
+                      'line con 0 / login authentication CONSOLE',
+                      'line con 0 / exec-timeout 5 0',
+                      'ip access-list standard MGMT / permit 192.0.2.0 0.0.0.255',
+                      'login block-for 120 attempts 3 within 60',
+                      'ip http authentication aaa',
+                      'snmp-server community configured [value hidden]',
+                      'logging host 192.0.2.20', 'ntp server 192.0.2.30',
+                      'netconf-yang', 'restconf'):
+            self.assertIn(value, facts)
+
+    def test_palo_shared_auth_profiles_roles_interfaces_and_logs_are_filtered(self):
+        from cisco_audit.core import extract_palo_config
+        xml = '''<config><mgt-config><users><entry name="admin"><permissions><role-based><custom><profile>auditor</profile></custom></role-based></permissions><authentication-profile>corp-radius</authentication-profile><phash>HASH_DO_NOT_EXPORT</phash></entry></users></mgt-config>
+<shared><authentication-profile><entry name="corp-radius"><method><radius><server-profile>RADIUS_SECRET_DO_NOT_EXPORT</server-profile></radius></method><factors><enable>yes</enable></factors></entry></authentication-profile>
+<admin-role><entry name="auditor"><role><device><cli>superreader</cli><xmlapi><enabled>yes</enabled></xmlapi><webui><monitor><logs>read-only</logs></monitor></webui></device></role><description>ROLE_SECRET_DO_NOT_EXPORT</description></entry></admin-role></shared>
+<devices><entry name="localhost.localdomain"><deviceconfig><system><timezone>UTC</timezone><ntp-servers><primary-ntp-server><ntp-server-address>192.0.2.123</ntp-server-address><authentication-key>NTP_KEY_DO_NOT_EXPORT</authentication-key></primary-ntp-server></ntp-servers></system></deviceconfig>
+<network><profiles><interface-management-profile><entry name="MGMT"><ssh>yes</ssh><telnet>no</telnet><permitted-ip><entry name="2001:db8::/32"/><entry name="BAD_SECRET_DO_NOT_EXPORT"/></permitted-ip><password>PROFILE_SECRET_DO_NOT_EXPORT</password></entry></interface-management-profile></profiles>
+<interface><ethernet><entry name="ethernet1/1"><layer3><interface-management-profile>MGMT</interface-management-profile></layer3></entry></ethernet></interface></network>
+<log-settings><system><match-list><entry name="logs"><send-syslog><member>syslog-main</member></send-syslog><secret>LOG_SECRET_DO_NOT_EXPORT</secret></entry></match-list></system></log-settings>
+</entry></devices></config>'''
+        facts, accounts = extract_palo_config(xml)
+        self.assertEqual(accounts[0]['privilege'], 'custom:auditor')
+        for value in ('HASH_DO_NOT_EXPORT', 'RADIUS_SECRET_DO_NOT_EXPORT',
+                      'ROLE_SECRET_DO_NOT_EXPORT', 'NTP_KEY_DO_NOT_EXPORT',
+                      'BAD_SECRET_DO_NOT_EXPORT', 'PROFILE_SECRET_DO_NOT_EXPORT',
+                      'LOG_SECRET_DO_NOT_EXPORT'):
+            self.assertNotIn(value, repr((facts, accounts)))
+        for value in ('authentication-profile corp-radius method radius',
+                      'authentication-profile corp-radius additional-factors-enabled yes',
+                      'admin-role auditor configured', 'admin-role auditor cli superreader',
+                      'interface-management-profile MGMT ssh yes',
+                      'interface-management-profile MGMT permitted-ip 2001:db8::/32',
+                      'interface ethernet1/1 management-profile MGMT',
+                      'system timezone UTC', 'system ntp primary 192.0.2.123',
+                      'system log forwarding syslog-profile syslog-main'):
+            self.assertIn(value, facts)

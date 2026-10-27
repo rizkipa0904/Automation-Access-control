@@ -65,24 +65,32 @@ The launcher is the recommended entry point because it prepares the environment 
 4. For per-device credentials, fill the table or import a CSV with the exact header `ip,port,username,password`. An empty port uses `22`. The CSV template contains placeholder credentials only. CSV passwords are plaintext; protect and delete the source file according to your policy.
 5. For a trusted legacy Cisco device only, you may enable **Legacy SSH compatibility**. It permits weaker SSHv2 algorithms when supported by the installed SSH library. Host key verification remains enabled. This option does not support SSHv1 and is unavailable for Palo Alto.
 6. Click **Start review**. If a device presents an unknown host key, verify the fingerprint using a trusted, separate source before approving it. A changed trusted key is blocked and must be resolved through your normal host-key process.
-7. The dashboard shows counts for **Total devices**, **In progress**, **Failed**, and **Done** for the selected scan. Select an IP to open its sanitized activity, current command, issues, and filtered evidence. The terminal-style panel is an activity preview, not an unrestricted raw terminal.
+7. The dashboard shows **Total devices**, **In progress**, **Needs attention**, and **Done** for the selected scan. **Needs attention** includes failed, partial, cancelled, interrupted, and host-key verification results. **Done** counts devices whose collection completed; it does not mean their controls passed. Select an IP to open its sanitized activity, current command, issues, and filtered evidence. The terminal-style panel is an activity preview, not an unrestricted raw terminal.
 8. Select **Download report** after the scan completes to download the `.xlsx` workbook. The report is a snapshot of collected and sanitized evidence. A completed scan does not mean all controls passed or that all accounts were discovered.
 
 At most five SSH connections run concurrently across all projects. Additional targets wait in a queue. Avoid repeated authentication attempts that could trigger account lockout.
 
+### Rerun a scan or one device
+
+Select a completed scan and click **Rerun scan** to review all its devices again. To retry only one target, open that device's details and click **Rerun this device**. The new scan form copies the previous platform, Cisco legacy SSH setting when applicable, and selected IP addresses and ports. Enter the SSH username and password again, then click **Start scan rerun** or **Start device rerun**. Credentials and CSV contents are never recovered from an earlier scan. A rerun creates a separate scan with its own live status and report; the previous result remains available.
+
+Each project can keep up to **100 saved scans**. At that limit, download any report you need, select an old completed scan, and click **Delete scan** to make room. Deletion removes that saved scan and its locally generated report data and cannot be undone. A running scan cannot be deleted; cancel it and wait until it has finished first. Protect exported reports separately because deleting a scan does not remove files already downloaded to your computer.
+
 ## What the audit collects
 
-**The device command channel is restricted to the literal `show ...` commands listed below.** No `configure`, `set`, `delete`, `commit`, `clear`, `request`, or other operational/configuration command is sent. The only other terminal input is a space character to advance a paginated read-only response. A command failure, unsupported output, insufficient privilege, or parser mismatch is recorded as a collection issue; the app does not fall back to arbitrary commands.
+**The device command channel sends only the literal, built-in `show ...` commands listed below.** It does not send configuration commands, operational commands that change state, paging keystrokes, confirmations, or user-provided commands. If output is paginated, times out, exceeds the size limit, or cannot be parsed safely, the affected collection is marked incomplete. The app records the limitation instead of sending an unapproved response to the device. A command failure or insufficient privilege is also recorded as a collection issue.
 
 ### Cisco IOS / IOS XE
 
-The current command allowlist is:
+The possible command allowlist is:
 
 - `show version`, `show inventory`: device identity, model/version and available inventory identifiers.
 - `show privilege`: privilege level of the account used for this scan; it is not the level of every user.
 - `show ip ssh`: SSH enabled/disabled and version where available.
-- `show users`, `show ssh`: session commands are run, but their session output is intentionally not exported.
+- `show users`, `show ssh`: session commands are run when supported, but their session output is intentionally not exported.
 - `show running-config`: a strict parser extracts visible local usernames and privilege, AAA authentication/authorization/accounting method lists, RADIUS/TACACS+ group/server references and safe server addresses/ports, selected VTY login/authorization/accounting/transport/access-class/timeout settings, and configured SSH version. Secret keys and unrecognized lines are omitted.
+
+The collector starts with `show version` and proceeds only if the response identifies Cisco IOS or IOS XE with a numeric version. On IOS releases before 12.1(15), it omits `show ssh` because support is not verified. If the account lands at an unprivileged `>` prompt, it omits `show ip ssh` and `show running-config`. These skipped checks are recorded as issues rather than inferred as absent. Unrecognized identity/version output stops the command sequence. Command support still varies by device, release, and assigned privilege; skipped or unsupported commands produce a partial result. A custom prompt that cannot be recognized safely also stops collection.
 
 The workbook can therefore show an example such as:
 
@@ -98,11 +106,13 @@ This is illustrative output, not a recommendation that the sample configuration 
 
 ### Palo Alto Networks PAN-OS
 
-The current command allowlist is:
+The possible command allowlist is:
 
 - `show system info`: hostname, model, serial and PAN-OS version when recognized.
 - `show admins all`: administrator names known to the firewall. Vendor documentation says this can include local, remote, and Panorama-pushed administrators, whether or not they are currently logged in. It is not the active-session list.
 - `show config running`: a strict XML parser extracts local admin names and recognized role/profile references, safe password-complexity values, administrator authentication-profile references and methods when present, management permitted IPs, management service flags, idle timeout, and lockout settings. Password hashes, private keys, and unrecognized fields are not exported.
+
+The collector starts with `show system info` and proceeds only when its `sw-version` identifies a PAN-OS major version from 7 through 12 and the CLI is in operational mode (`>`). PAN-OS HA status suffix changes in the prompt are handled; unrelated prompt changes stop collection. If version or mode cannot be verified, the scan records a partial result without trying further commands. Version and role differences can make an otherwise allowed command unavailable. Non-XML `show config running` output cannot be parsed safely, so its audit fields are reported incomplete.
 
 An illustrative workbook excerpt could look like this:
 
@@ -119,17 +129,32 @@ Names and values above are fictitious examples. `show admins all` can list remot
 
 **MFA limitation:** the report distinguishes an observed external authentication path from verified MFA enforcement. The app cannot query the RADIUS/SAML provider or validate a second-factor challenge. Palo Alto documentation also notes that additional factors configured for authentication profiles are not supported for remote GlobalProtect or PAN-OS/Panorama administrator authentication; supported MFA integrations for those uses depend on RADIUS or SAML configuration. Verify the actual administrator-authentication path and provider-side policy independently. See the vendor documentation linked below.
 
+## Access-control checklist mapping
+
+Each device detail and its Excel report group show six checklist items for the selected platform. The 12 IDs below map the review areas to sanitized device observations and follow-up work. A listed command is an evidence source when that command is supported, permitted, completed, and safely parsed; its presence in the table does not mean the evidence was collected for every device.
+
+| ID | Review area | Potential device evidence | Manual or external verification |
+| --- | --- | --- | --- |
+| PA-01 | Administrator accounts and privileges | `show admins all`; administrator and role/profile fields from `show config running` | Reconcile local, remote, and Panorama accounts with approved owners and identity-provider groups; confirm effective Web UI, CLI, API, and virtual-system roles. |
+| PA-02 | Authentication and sessions | Authentication-profile, password-complexity, idle-timeout, and lockout fields from `show config running` | Verify login paths, emergency accounts, and the identity provider's MFA policy and actual challenge. |
+| PA-03 | Management access sources | Permitted management IPs extracted from `show config running` | Trace bastion paths, management-profile assignments, IPv4/IPv6 sources, and external network controls. |
+| PA-04 | Services and API access | Recognized management SSH, Telnet, HTTP, and HTTPS service flags from `show config running` | Check each management interface, API roles, key lifetime and revocation, SNMP, TLS policy, and source restrictions. |
+| PA-05 | Administrator activity logging | No logging or forwarding fields are currently extracted from the PAN-OS configuration | Sample System and Config logs; confirm log receipt, retention, timestamps, and change-ticket correlation at the destination. |
+| PA-06 | Access lifecycle | Administrator names and roles from `show admins all` and `show config running` | Compare with HR records, owner approvals, transfers, departures, active sessions, and API-key revocation. |
+| CS-01 | Administrator accounts and privileges | Local usernames, privilege, AAA authorization, and server-group fields from `show running-config`; `show privilege` for the scan account | Reconcile local and RADIUS/TACACS+ users with approved owners and effective server-assigned privileges. |
+| CS-02 | AAA login and sessions | AAA authentication, VTY/console, and session-related fields from `show running-config`; `show users` runs without exporting session output | Verify method-list application, fallback, failed-login controls, login behavior, and MFA at the external provider. |
+| CS-03 | Management access sources | VTY ACL/transport and management-interface fields from `show running-config`; SSH state from `show ip ssh` | Trace IPv4/IPv6 ACLs, management interfaces and VRFs to approved sources; review Telnet exposure and external access paths. |
+| CS-04 | Services other than SSH | Recognized HTTP, SNMP, NETCONF, and RESTCONF fields from `show running-config` | Check service authentication, least privilege, source restrictions, and whether unused services are disabled. |
+| CS-05 | Logging and accounting | AAA accounting, logging, and device-time fields from `show running-config` | Sample login and command records; verify log delivery, time synchronization, and retention. |
+| CS-06 | Access lifecycle and emergency accounts | Local accounts and privileged-secret presence from `show running-config` | Reconcile personnel and approvals; sample break-glass use, SSH-key and secret rotation, and revocation. |
+
+Checklist statuses describe **evidence coverage**, not compliance: **Needs review** means matching sanitized observations exist; **Attention** flags a visible condition needing review; **Not collected** means no matching field was extracted; **Manual verification** marks lifecycle items that require external records. Even where device fields are present, the app does not verify HR approvals, identity-provider MFA enforcement, log receipt, or access revocation. Missing fields do not prove a control is absent.
+
 ## Excel report and status meanings
 
-The workbook contains:
+The workbook has **one Audit Results sheet**. Scan metadata and device-status counts appear at the top. Results are grouped by IP address and port, so each device has its collection status, identity, **Checklist** rows, access-control checks, account list, selected configuration facts, collection issues, and sanitized evidence together. Checklist rows include their IDs, status, observation, follow-up, and evidence reference. The columns are **IP / device**, **Section**, **Check / item**, **Sanitized result**, **Status**, **Evidence ID**, **Read-only command**, **Scope / follow-up**, and **Collected (UTC)**. Evidence IDs link to the corresponding evidence row in the same sheet.
 
-- **Run Summary** — project/run metadata, platform, target totals and device statuses.
-- **Device Inventory** — IP/port, platform, extracted identity, completion time, status, and completeness note.
-- **Scan Results** — access-control checks, sanitized observations, evidence links, status, and limitations.
-- **Accounts** — usernames and extracted privilege/role, with source command and evidence IDs.
-- **Access Configuration** — sanitized AAA, management, authentication-profile, password-complexity, and related settings.
-- **Evidence** — filtered command excerpts with device IDs and timestamps.
-- **Collection Issues** — failed or incomplete stages and their impact.
+For a partial or failed device, review its **Issue** rows and the collection status before interpreting missing checks. An interrupted scan may have no device completion timestamp even if some filtered evidence was collected.
 
 `Observed` means a field was extracted; it is not a pass. `Attention` flags a condition that merits review; it is not necessarily a failure. `Not Available` means the app could not establish the requested fact from the collected evidence. Missing data must never be treated as proof that a user, restriction, or control does not exist.
 
@@ -148,7 +173,8 @@ The workbook contains:
 - **Browser did not open:** copy the `127.0.0.1` URL from the terminal into a browser on the same computer.
 - **SSH connection or authentication fails:** verify reachability, port, credentials, device AAA policy, and that the scan account is not locked. Avoid repeated retries.
 - **Host key verification required:** independently verify the fingerprint. Do not approve an unexpected key.
-- **Partial or missing fields:** check the workbook's **Collection Issues** sheet, device version, command support, privilege, and output format. Missing fields do not imply that a control is disabled.
+- **Device prompt was not detected before the timeout:** open the affected device's details and check the command named in the **Issue** rows of the **Audit Results** sheet. Confirm that the account can run that exact `show` command, the device is using the selected platform and supported OS family, and its CLI output is not paused by pagination or an interactive message. A partial result must not be treated as a completed audit. The app does not send paging keys or confirmation responses; resolve the device-side output or privilege issue before rerunning.
+- **Partial or missing fields:** check the **Issue** rows of the **Audit Results** sheet, device version, command support, privilege, and output format. Missing fields do not imply that a control is disabled.
 - **Update reports local changes would be overwritten:** inspect `git status --short`, back up or commit wanted changes, then retry the fast-forward pull.
 
 ## Development and tests
@@ -158,7 +184,7 @@ The workbook contains:
 node tests/test_ui.js
 ```
 
-Fixture tests do not replace verification against authorized lab devices. Before production use, validate the device models, OS versions, output formats, privileges, host-key process, partial-output behavior, and report contents used by your organization.
+Fixture tests verify application behavior without contacting devices. They do not establish compatibility with every hardware model, software release, CLI customization, AAA policy, or terminal setting. Before using the tool for a production audit, validate each device family and release with authorized lab devices, including the exact read-only account, host-key verification, command output, pagination behavior, incomplete-result handling, and workbook contents. A live device that has not been validated for these conditions should be treated as unsupported until the behavior is confirmed.
 
 ## Vendor references
 

@@ -6,6 +6,7 @@ import stat
 import sys
 import os
 import tempfile
+import time
 from collections import Counter
 import secrets
 import threading
@@ -18,6 +19,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from cisco_audit.core import collect, validate_target
+from cisco_audit.checklist import evaluate
 from cisco_audit.report import workbook
 
 ROOT = Path(__file__).resolve().parent
@@ -27,6 +29,9 @@ PROJECTS = {}
 LOCK = threading.RLock()
 MAX_TARGETS = 200
 MAX_PROJECTS = 100
+MAX_RUNS_PER_PROJECT = 100
+STATE_SAVE_INTERVAL = 1.0
+LAST_STATE_SAVE = 0.0
 SSH_POOL = ThreadPoolExecutor(max_workers=5, thread_name_prefix="ssh-review")
 # Futures are process-local and never persisted.
 FUTURES = {}
@@ -60,13 +65,15 @@ def acquire_instance_lock():
         raise
 
 
-def save_state():
+def save_state(*, force=True):
     """Called under LOCK; persist only already-sanitized snapshots, never credentials or keys."""
-    global STORAGE_ERROR
+    global STORAGE_ERROR, LAST_STATE_SAVE
     temp_name = None
     if STORAGE_BLOCKED:
         STORAGE_ERROR = 'Local project data could not be read; the existing file was not overwritten.'
         return False
+    if not force and STORAGE_ERROR is None and time.monotonic() - LAST_STATE_SAVE < STATE_SAVE_INTERVAL:
+        return True
     try:
         if DATA_DIR.is_symlink():
             raise OSError('Invalid data directory')
@@ -81,6 +88,7 @@ def save_state():
             temp.flush()
             os.fsync(temp.fileno())
         os.replace(temp_name, STATE_FILE)
+        LAST_STATE_SAVE = time.monotonic()
         STORAGE_ERROR = None
         return True
     except (OSError, TypeError, ValueError):
@@ -207,7 +215,7 @@ def worker(run, targets):
         def update(status):
             with LOCK:
                 run['results'][index]['status'] = status
-                save_state()
+                save_state(force=False)
 
         def on_event(event):
             with LOCK:
@@ -237,7 +245,7 @@ def worker(run, targets):
                     result.setdefault('activity', []).append(item)
                 if len(result.get('activity', [])) > 300:
                     result['activity'] = result['activity'][-300:]
-                save_state()
+                save_state(force=False)
 
         if run['cancel'].is_set():
             return {'ip': target['ip'], 'port': target['port'], 'status': 'cancelled', 'issues': [], 'evidence': [], 'accounts': [], 'facts': []}
@@ -267,6 +275,7 @@ def worker(run, targets):
             # The collector returns its sanitized findings; the event callback
             # owns the ordered live terminal transcript. Keep both snapshots.
             result['activity'] = list(run['results'][index].get('activity', []))
+            result['current_command'] = ''
             if 'host_key' in result:
                 key = result['host_key'].pop('key')
                 endpoint = result['ip'] if result['port'] == 22 else f"[{result['ip']}]:{result['port']}"
@@ -277,7 +286,7 @@ def worker(run, targets):
                 run['finished'] = now()
                 run['done'] = True
                 FUTURES.pop(rid, None)
-            save_state()
+            save_state(force=remaining[0] == 0)
 
     # Holding LOCK while registering futures ensures cancellation sees the
     # complete list, even when very fast tasks finish during submission.
@@ -297,7 +306,8 @@ def public(run):
 def run_summary(run):
     return {'id': run['id'], 'project_id': run['project_id'], 'platform': run['platform'],
             'started': run['started'], 'done': run['done'], 'total': len(run['results']),
-            'counts': dict(Counter(r['status'] for r in run['results']))}
+            'counts': dict(Counter(r['status'] for r in run['results'])),
+            'rerun_of': run.get('rerun_of')}
 
 def project_summary(project):
     return {'id': project['id'], 'name': project['name'], 'created': project['created'],
@@ -363,6 +373,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not run:
                     return self.respond({'error': 'Scan not found'}, 404)
                 snapshot = json.loads(json.dumps(public(run)))
+            for index, result in enumerate(snapshot['results'], 1):
+                result['checklist'] = evaluate(result, snapshot['platform'], f'D{index:04d}')
             if len(parts) == 3 and parts[2] == 'xlsx':
                 data = workbook(snapshot)
                 self.headers_common(200, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
@@ -406,6 +418,9 @@ class Handler(BaseHTTPRequestHandler):
                 platform = body.get('platform')
                 if platform not in ('cisco', 'paloalto'):
                     raise ValueError('Select Cisco or Palo Alto as the platform.')
+                rerun_of = body.get('rerun_of')
+                if rerun_of is not None and (not isinstance(rerun_of, str) or not rerun_of):
+                    raise ValueError('The original scan is unavailable for rerun.')
                 legacy = body.get('legacy', False)
                 if type(legacy) is not bool:
                     raise ValueError('Invalid input.')
@@ -429,8 +444,14 @@ class Handler(BaseHTTPRequestHandler):
                     project = PROJECTS.get(project_id)
                     if project is None:
                         raise ValueError('Select an available project.')
+                    if len(project['runs']) >= MAX_RUNS_PER_PROJECT:
+                        raise ValueError('This project has reached 100 saved scans. Download and delete an old completed scan before starting another.')
+                    if rerun_of is not None:
+                        source = RUNS.get(rerun_of)
+                        if source is None or source['project_id'] != project_id or not source['done']:
+                            raise ValueError('The original scan is unavailable for rerun.')
                     rid = uuid.uuid4().hex
-                    run = {'id': rid, 'project_id': project_id, 'project_name': project['name'], 'started': now(), 'platform': platform, 'legacy': legacy, 'done': False, 'cancel': threading.Event(), 'results': [{'ip': t['ip'], 'port': t['port'], 'status': 'queued', 'issues': [], 'evidence': [], 'activity': [], 'accounts': [], 'facts': []} for t in targets]}
+                    run = {'id': rid, 'project_id': project_id, 'project_name': project['name'], 'started': now(), 'platform': platform, 'legacy': legacy, 'rerun_of': rerun_of, 'done': False, 'cancel': threading.Event(), 'results': [{'ip': t['ip'], 'port': t['port'], 'status': 'queued', 'issues': [], 'evidence': [], 'activity': [], 'accounts': [], 'facts': []} for t in targets]}
                     RUNS[rid] = run
                     project['runs'].append(rid)
                     if not save_state():
@@ -467,8 +488,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond({'ok': True})
             return self.respond({'error': 'Not found'}, 404)
         except (ValueError, TypeError) as exc:
-            message = str(exc) if isinstance(exc, ValueError) and (str(exc).startswith('Row ') or str(exc) in ('The target count must be between 1 and 200.', 'Select an available project.', 'Enter a project name (100 characters maximum).', 'The project limit has been reached.', 'A project with this name already exists.', 'Scan not found.', 'The host key is unavailable or its fingerprint does not match.', 'Invalid request size.', 'Select Cisco or Palo Alto as the platform.', 'Legacy SSH compatibility is available for Cisco only.')) else 'Invalid input.'
+            message = str(exc) if isinstance(exc, ValueError) and (str(exc).startswith('Row ') or str(exc) in ('The target count must be between 1 and 200.', 'Select an available project.', 'Enter a project name (100 characters maximum).', 'The project limit has been reached.', 'A project with this name already exists.', 'Scan not found.', 'The host key is unavailable or its fingerprint does not match.', 'Invalid request size.', 'Select Cisco or Palo Alto as the platform.', 'Legacy SSH compatibility is available for Cisco only.', 'The original scan is unavailable for rerun.', 'This project has reached 100 saved scans. Download and delete an old completed scan before starting another.')) else 'Invalid input.'
             return self.respond({'error': message}, 400)
+
+    def do_DELETE(self):
+        if not self.valid(True):
+            return self.respond({'error': 'Forbidden'}, 403)
+        parts = urlparse(self.path).path.strip('/').split('/')
+        if len(parts) != 2 or parts[0] != 'runs':
+            return self.respond({'error': 'Not found'}, 404)
+        with LOCK:
+            run = RUNS.get(parts[1])
+            if run is None:
+                return self.respond({'error': 'Scan not found'}, 404)
+            if not run['done']:
+                return self.respond({'error': 'Cancel the scan and wait for it to finish before deleting it.'}, 409)
+            project = PROJECTS[run['project_id']]
+            run_index = project['runs'].index(parts[1])
+            del RUNS[parts[1]]
+            project['runs'].pop(run_index)
+            if not save_state():
+                RUNS[parts[1]] = run
+                project['runs'].insert(run_index, parts[1])
+                return self.respond({'error': STORAGE_ERROR}, 500)
+        return self.respond({'ok': True})
 
 def main():
     try:

@@ -34,3 +34,24 @@
 #scan-form{margin-top:18px}.main-column>.workspace{grid-template-columns:minmax(0,1fr) 270px}
 @media(max-width:900px){.app-layout{grid-template-columns:210px minmax(0,1fr);gap:12px}.project-dashboard{padding:20px}.status-cards{grid-template-columns:repeat(2,minmax(0,1fr))}.device-row{grid-template-columns:1fr auto}.device-progress{grid-column:1/-1;grid-row:2}.device-row .badge{grid-column:2;grid-row:1}}
 @media(max-width:680px){.app-layout{grid-template-columns:1fr}.project-sidebar{position:relative;top:auto;height:auto;min-height:0;max-height:340px;order:0}.sidebar-note{display:none}.project-dashboard{padding:18px}.dashboard-heading{flex-direction:column}.dashboard-heading .actions{width:100%}.dashboard-heading .actions button{flex:1}.status-cards{gap:8px}.status-card{padding:10px}.status-card strong{font-size:21px}.scan-history .scan-item{min-width:100%}.dashboard-results-heading{align-items:flex-start}.device-row{gap:7px;padding:12px}.main-column>.workspace{grid-template-columns:1fr}}
+
+/* Scan actions and rerun guidance. */
+.dashboard-heading>div:first-child{min-width:0;flex:1}
+.scan-actions{justify-content:flex-end;align-content:flex-start;max-width:480px}
+.scan-actions button{white-space:nowrap}
+.danger-outline{background:#fff;color:#a34840;border-color:#ebc7c2}
+.danger-outline:hover:not(:disabled){background:#fff1ef;color:#8b2f28}
+.rerun-context{margin:16px 0 2px;padding:11px 13px;border:1px solid #b8ddd7;border-left:4px solid #168a7b;border-radius:7px;background:#eef9f6;color:#24564f;font-size:12px;line-height:1.55}
+.form-error:not(:empty){padding:10px 12px;border:1px solid #efc4bc;border-radius:7px;background:#fff5f3}
+.device-actions{display:flex;gap:9px;justify-content:flex-end;margin-top:16px;padding-top:14px;border-top:1px solid #203641}
+.device-rerun{background:#102c35;color:#b9efe1;border-color:#2a6c65}
+.device-rerun:hover:not(:disabled){background:#174039;color:#e8fff7}
+.access-pending{padding:11px 12px;border:1px dashed #39525d;border-radius:7px;background:#0c1b24;color:#9eb6be;font-size:11px}
+.control-checklist{margin:16px 0;padding-top:13px;border-top:1px solid #203641}.checklist-heading{display:flex;justify-content:space-between;align-items:center;gap:10px}.checklist-heading .preview-heading{margin:0 0 9px}.checklist-count{font-size:10px;color:#8ea9b0}.checklist-item{margin:6px 0;border:1px solid #25404b;border-radius:7px;background:#0d1e27;overflow:hidden}.checklist-summary{display:grid;grid-template-columns:auto minmax(0,1fr) auto auto;align-items:center;gap:8px;padding:9px 11px;list-style:none;cursor:pointer}.checklist-summary::-webkit-details-marker{display:none}.checklist-summary::after{content:'⌄';color:#8ca5af;font-size:14px}.checklist-item[open] .checklist-summary::after{content:'⌃'}.checklist-summary:hover{background:#142b35}.checklist-id{font:700 11px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color:#a1e8d1}.checklist-area{min-width:0;overflow-wrap:anywhere;font-size:11px;color:#d7e5e8}.checklist-status{font-size:9px;font-weight:800;letter-spacing:.02em;color:#a9c4d7;white-space:nowrap}.checklist-status.status-attention{color:#ffad8a}.checklist-status.status-manual-verification{color:#f4d38d}.checklist-status.status-not-collected{color:#9aaeb8}.checklist-content{padding:11px 13px 13px;border-top:1px solid #25404b}.checklist-content strong{display:block;margin:7px 0 2px;font-size:10px;color:#9ad4c1}.checklist-content strong:first-child{margin-top:0}.checklist-content p{font-size:11px;line-height:1.55;color:#bfd0d2;white-space:pre-wrap;overflow-wrap:anywhere}.checklist-evidence{display:block;margin-top:10px;color:#8aa8b2;font-size:10px}
+.terminal-live-badge{color:#8ca5af}.terminal-live-badge.live{color:#75dfa9}
+.device-row .badge.status-completed{background:#e5f5ed;color:#217451}
+.device-row .badge.status-queued,.device-row .badge.status-connecting,.device-row .badge.status-collecting{background:#e7f4f8;color:#186e83}
+.device-row .badge.status-failed,.device-row .badge.status-partial,.device-row .badge.status-interrupted,.device-row .badge.status-host_key_unknown{background:#fff0eb;color:#a64c36}
+.device-row .badge.status-cancelled{background:#f1f0f5;color:#695c79}
+@media(max-width:1050px){.dashboard-heading{flex-direction:column}.scan-actions{max-width:none;width:100%;justify-content:flex-start}}
+@media(max-width:680px){.scan-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}.scan-actions button{white-space:normal}.device-actions{justify-content:stretch}.device-actions button{width:100%}.checklist-summary{grid-template-columns:auto minmax(0,1fr) auto}.checklist-status{grid-column:2;grid-row:2}.checklist-summary::after{grid-column:3;grid-row:1/3}}

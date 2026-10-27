@@ -23,7 +23,77 @@ MODERN_DISABLED = {
 PALO_COMMANDS = ('show system info', 'show admins all', 'show config running')
 PLATFORM_COMMANDS = {'cisco': COMMANDS, 'paloalto': PALO_COMMANDS}
 MAX_OUTPUT = 2_000_000
-PROMPT = re.compile(r'^[A-Za-z0-9_.:@/-]{1,120}[#>]\s*$')
+CISCO_PROMPT = re.compile(r'^[A-Za-z0-9_.:@/-]{1,120}[#>]$')
+# PAN-OS HA status is part of the prompt and may change during a session.
+PALO_PROMPT = re.compile(r'^(?P<identity>[A-Za-z0-9_.-]{1,64}@[A-Za-z0-9_.:-]{1,120})(?:\([A-Za-z0-9_-]{1,48}\))?[#>]$')
+ANSI_CSI = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]')
+ANSI_OSC = re.compile(r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
+
+
+class SessionSyncError(ValueError):
+    """The shell cannot safely accept another command in this session."""
+
+
+def _terminal_text(raw):
+    """Normalize terminal decoration for prompt matching and safe parsing."""
+    text = raw.decode('utf-8', 'replace') if isinstance(raw, bytes) else raw
+    text = ANSI_OSC.sub('', ANSI_CSI.sub('', text))
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
+    # Backspace-based prompt repainting is common on interactive SSH shells.
+    while '\x08' in text:
+        text = re.sub(r'[^\n]\x08', '', text).replace('\x08', '')
+    return re.sub(r'[\x00-\x07\x0b-\x1f\x7f]', '', text)
+
+
+def _last_prompt(output):
+    lines = output.splitlines()
+    return lines[-1].strip() if lines else ''
+
+
+def _prompt_identity(prompt, platform):
+    if platform == 'paloalto':
+        match = PALO_PROMPT.fullmatch(prompt)
+        return match.group('identity') if match else None
+    return prompt if CISCO_PROMPT.fullmatch(prompt) else None
+
+
+def _prompt_matches(candidate, expected, platform):
+    identity = _prompt_identity(candidate, platform)
+    if identity is None:
+        return False
+    if expected is None:
+        return True
+    # Only a PAN-OS HA state suffix may change. A new username, hostname, or
+    # CLI mode is not a safe indication that the previous command completed.
+    return candidate == expected if platform != 'paloalto' else (
+        identity == _prompt_identity(expected, platform) and candidate.endswith('>') == expected.endswith('>'))
+
+
+def _identity_commands(platform, raw, prompt):
+    """Choose only literal documented show commands after identifying the OS."""
+    if platform == 'paloalto':
+        match = re.search(r'(?im)^\s*sw-version:\s*(\d+)\.(\d+)(?:[.\w-]*)\s*$', raw)
+        if not match or not 7 <= int(match.group(1)) <= 12:
+            raise ValueError('PAN-OS version could not be verified; no further commands were sent.')
+        return PALO_COMMANDS[1:], []
+
+    xe = re.search(r'(?im)^Cisco IOS[ -]XE Software\b[^\n]*\bVersion\s+(\d+)\.(\d+)(?:\((\d+)\))?', raw)
+    ios = re.search(r'(?im)^Cisco IOS Software\b[^\n]*\bVersion\s+(\d+)\.(\d+)(?:\((\d+)\))?', raw)
+    if not ios and not xe and re.search(r'(?im)^Cisco Internetwork Operating System Software\s*$', raw):
+        ios = re.search(r'(?im)^IOS\s*\([^\n]*\bVersion\s+(\d+)\.(\d+)(?:\((\d+)\))?', raw)
+    match = xe or ios
+    if not match:
+        raise ValueError('Cisco IOS or IOS XE version could not be verified; no further commands were sent.')
+    commands = list(COMMANDS[1:])
+    skipped = []
+    if not xe and (int(match.group(1)), int(match.group(2)), int(match.group(3) or 0)) < (12, 1, 15):
+        commands.remove('show ssh')
+        skipped.append({'command': 'show ssh', 'message': 'This IOS release predates verified support for show ssh.'})
+    if prompt.endswith('>'):
+        for command in ('show ip ssh', 'show running-config'):
+            commands.remove(command)
+            skipped.append({'command': command, 'message': 'Privileged EXEC access is required for this show command.'})
+    return tuple(commands), skipped
 
 
 def _send_allowed_show_command(channel, platform, command):
@@ -100,6 +170,29 @@ def _safe_aaa_fact(line):
     return True
 
 
+def _safe_acl_rule(line):
+    """Retain only address/port ACL rules; discard remarks and object names."""
+    tokens = line.lower().split()
+    if tokens and tokens[0].isdigit() and int(tokens[0]) <= 65535:
+        tokens.pop(0)
+    if len(tokens) < 2 or tokens[0] not in ('permit', 'deny'):
+        return False
+    words = {'any', 'host', 'ip', 'ipv6', 'tcp', 'udp', 'icmp', 'icmp6',
+             'gre', 'esp', 'ahp', 'ospf', 'eq', 'neq', 'lt', 'gt', 'range',
+             'log', 'log-input', 'established', 'fragments', 'ssh', 'telnet',
+             'www', 'https', 'domain', 'snmp', 'snmptrap', 'ntp'}
+    for token in tokens[1:]:
+        if token in words:
+            continue
+        if token.isdigit() and 0 <= int(token) <= 65535:
+            continue
+        try:
+            ipaddress.ip_network(token, strict=False)
+        except ValueError:
+            return False
+    return True
+
+
 def extract_config(raw):
     """Strict allowlist of useful facts; never preserve arbitrary configuration lines."""
     facts, accounts = [], []
@@ -107,7 +200,12 @@ def extract_config(raw):
     for line in raw.splitlines():
         s = line.strip()
         if not line.startswith((' ', '\t')):
-            if re.fullmatch(r'line vty [0-9 ]+', s, re.I):
+            if re.fullmatch(r'line (?:vty [0-9 ]+|con(?:sole)? \d+|aux \d+)', s, re.I):
+                context = s
+            elif re.fullmatch(r'(?:ip access-list (?:standard|extended)|ipv6 access-list) [A-Za-z0-9_.-]{1,64}', s, re.I):
+                context = s
+                facts.append(s)
+            elif re.fullmatch(r'interface (?:Vlan|Loopback)\d{1,5}', s, re.I):
                 context = s
             elif re.fullmatch(r'(?:radius|tacacs) server [A-Za-z0-9_.-]{1,64}', s, re.I):
                 context = s
@@ -124,6 +222,12 @@ def extract_config(raw):
             if re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', name):
                 accounts.append({'username': name, 'privilege': m.group(2) or 'unspecified'})
             continue
+        if re.match(r'^enable secret(?:\s|$)', s, re.I):
+            facts.append('enable secret configured [value hidden]')
+            continue
+        if re.match(r'^enable password(?:\s|$)', s, re.I):
+            facts.append('enable password configured [value hidden]')
+            continue
         # Preserve the VTY range on every fact: the method-list reference is
         # meaningful only together with the lines on which it is configured.
         name = r'[A-Za-z0-9_.-]{1,64}'
@@ -138,8 +242,23 @@ def extract_config(raw):
             r'privilege level \d{1,2}',
             r'no exec',
         )
-        if context and any(re.fullmatch(pattern, s, re.I) for pattern in vty_patterns):
+        if context.lower().startswith('line ') and any(re.fullmatch(pattern, s, re.I) for pattern in vty_patterns):
             facts.append(context + ' / ' + s)
+        elif context.lower().startswith(('ip access-list ', 'ipv6 access-list ')) and _safe_acl_rule(s):
+            facts.append(context + ' / ' + s)
+        elif context.lower().startswith('interface ') and re.fullmatch(r'(?:ip vrf forwarding|vrf forwarding) [A-Za-z0-9_.-]{1,64}', s, re.I):
+            facts.append(context + ' / ' + s)
+        elif context.lower().startswith('interface ') and re.fullmatch(r'(?:ip address (?:\d{1,3}\.){3}\d{1,3} (?:\d{1,3}\.){3}\d{1,3}|ipv6 address [0-9a-fA-F:]+/\d{1,3})', s, re.I):
+            parts = s.split()
+            try:
+                if parts[0].lower() == 'ip':
+                    ipaddress.IPv4Network(parts[2] + '/' + parts[3], strict=False)
+                else:
+                    ipaddress.IPv6Interface(parts[2])
+            except ValueError:
+                pass
+            else:
+                facts.append(context + ' / ' + s)
         elif context.lower().startswith(('radius server ', 'tacacs server ')):
             address = re.fullmatch(r'address ipv4 ([0-9.]{7,15})(?: auth-port (\d{1,5}))?(?: acct-port (\d{1,5}))?', s, re.I)
             if address:
@@ -160,6 +279,55 @@ def extract_config(raw):
             facts.append(s)
         elif re.fullmatch(r'ip ssh version [12]', s, re.I):
             facts.append(s)
+        elif re.fullmatch(r'login block-for \d{1,5} attempts \d{1,5} within \d{1,5}', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'login quiet-mode access-class [A-Za-z0-9_.-]{1,64}', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'login on-(?:failure|success) log', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'(?:no )?ip http (?:server|secure-server)', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'ip http authentication (?:aaa|local|enable|tacacs)', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'ip http access-class [A-Za-z0-9_.-]{1,64}', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'(?:no )?(?:netconf-yang|restconf)', s, re.I):
+            facts.append(s)
+        elif re.match(r'^snmp-server (?:community|user|group|host)(?:\s|$)', s, re.I):
+            # Community strings, SNMPv3 credentials and host lines can carry
+            # secrets. Only retain presence for the exact configuration class.
+            facts.append('snmp-server ' + s.split()[1].lower() + ' configured [value hidden]')
+        elif re.fullmatch(r'logging trap (?:emergencies|alerts|critical|errors|warnings|notifications|informational|debugging|[0-7])', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'(?:no )?logging on', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'logging (?:host )?(?:\d{1,3}\.){3}\d{1,3}', s, re.I):
+            address = s.split()[-1]
+            try:
+                ipaddress.IPv4Address(address)
+            except ValueError:
+                pass
+            else:
+                facts.append('logging host ' + address)
+        elif re.fullmatch(r'(?:no )?ntp authenticate', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'ntp server (?:\d{1,3}\.){3}\d{1,3}', s, re.I):
+            address = s.split()[-1]
+            try:
+                ipaddress.IPv4Address(address)
+            except ValueError:
+                pass
+            else:
+                facts.append(s)
+        elif re.match(r'^ntp trusted-key(?:\s|$)', s, re.I):
+            facts.append('ntp trusted-key configured [key ID hidden]')
+        elif re.fullmatch(r'service timestamps log (?:datetime|uptime)(?: msec| localtime| show-timezone| year)*', s, re.I):
+            facts.append(s)
+        elif re.fullmatch(r'access-list \d{1,3} (?:permit|deny) .+', s, re.I):
+            number = s.split()[1]
+            rule = ' '.join(s.split()[2:])
+            if _safe_acl_rule(rule):
+                facts.append('access-list ' + number + ' ' + rule)
     return facts, accounts
 
 
@@ -167,12 +335,17 @@ def sanitize_show(command, raw):
     # Other show outputs may also contain sensitive or attacker-controlled strings.
     # Keep only narrowly selected fields, never the full response.
     lines = []
+    classic_ios = command == 'show version' and bool(re.search(r'(?im)^Cisco Internetwork Operating System Software\s*$', raw))
     for line in raw.splitlines():
         line = line.strip()
         if command == 'show version':
-            match = re.search(r'(?i)^Cisco IOS(?: XE)? Software.*?Version\s+([A-Za-z0-9.()_-]+)', line)
+            match = re.search(r'(?i)^Cisco IOS(?:[ -]XE)? Software.*?Version\s+([A-Za-z0-9.()_-]+)', line)
             if match:
                 lines.append('Cisco IOS version: ' + match.group(1))
+            elif classic_ios:
+                match = re.search(r'(?i)^IOS\s*\([^\n]*\bVersion\s+([A-Za-z0-9.()_-]+)', line)
+                if match:
+                    lines.append('Cisco IOS version: ' + match.group(1))
             match = re.fullmatch(r'([A-Za-z0-9_.:-]{1,120}) uptime is ([0-9A-Za-z, ]{1,100})', line)
             if match:
                 lines.append(match.group(1) + ' uptime is ' + match.group(2))
@@ -273,10 +446,11 @@ def extract_palo_config(raw):
                 facts.append('password-complexity ' + node.tag + ' ' + value)
     # Authentication-profile metadata is useful for tracing admin auth routes,
     # but it cannot prove that an external provider actually enforces MFA.
-    auth_profiles = root.find('./mgt-config/authentication-profile')
-    if auth_profiles is not None:
+    auth_profiles = (root.findall('./shared/authentication-profile/entry') +
+                     root.findall('./mgt-config/authentication-profile/entry'))
+    if auth_profiles:
         methods = {'local', 'radius', 'ldap', 'tacplus', 'kerberos', 'saml', 'none'}
-        for entry in auth_profiles.findall('./entry'):
+        for entry in auth_profiles:
             profile_name = entry.get('name', '')
             if not re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', profile_name):
                 continue
@@ -293,6 +467,42 @@ def extract_palo_config(raw):
                     factor_name = factor.get('name', '')
                     if re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', factor_name):
                         facts.append('authentication-profile ' + profile_name + ' additional-factor-profile ' + factor_name)
+    # Role-profile names and fixed permission enums are useful audit evidence;
+    # descriptions and other free-form fields are never copied.
+    for entry in root.findall('./shared/admin-role/entry'):
+        role_name = entry.get('name', '')
+        if not re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', role_name):
+            continue
+        facts.append('admin-role ' + role_name + ' configured')
+        device_role = entry.find('./role/device')
+        if device_role is None:
+            continue
+        for area in ('cli', 'xmlapi', 'restapi'):
+            node = device_role.find('./' + area)
+            if node is None:
+                continue
+            value = (node.text or '').strip().lower()
+            if value in ('yes', 'no', 'enable', 'disable', 'read-only', 'superuser', 'superreader', 'deviceadmin', 'devicereader'):
+                facts.append('admin-role ' + role_name + ' ' + area + ' ' + value)
+            for child in node:
+                child_value = (child.text or '').strip().lower()
+                if (re.fullmatch(r'[A-Za-z0-9_-]{1,64}', child.tag)
+                        and child_value in ('yes', 'no', 'enable', 'disable', 'read-only')):
+                    facts.append('admin-role ' + role_name + ' ' + area + ' ' + child.tag + ' ' + child_value)
+        webui = device_role.find('./webui')
+        if webui is not None:
+            def add_webui_permissions(node, path):
+                if len(path) > 6 or len(facts) >= 500:
+                    return
+                for child in node:
+                    if not re.fullmatch(r'[A-Za-z0-9_-]{1,64}', child.tag):
+                        continue
+                    child_path = path + [child.tag]
+                    value = (child.text or '').strip().lower()
+                    if value in ('enable', 'disable', 'read-only'):
+                        facts.append('admin-role ' + role_name + ' webui ' + '/'.join(child_path) + ' ' + value)
+                    add_webui_permissions(child, child_path)
+            add_webui_permissions(webui, [])
     for device in root.findall('./devices/entry'):
         # Select only exact, non-secret management settings; absence remains unknown.
         system = device.find('./deviceconfig/system')
@@ -306,10 +516,17 @@ def extract_palo_config(raw):
                 except ValueError:
                     continue
                 facts.append('management permitted-ip ' + value)
-            for name in ('disable-ssh', 'disable-telnet', 'disable-http', 'disable-https'):
+            for name in ('disable-ssh', 'disable-telnet', 'disable-http', 'disable-https', 'disable-snmp'):
                 value = system.findtext('./service/' + name, default='').strip().lower()
                 if value in ('yes', 'no'):
                     facts.append('management service ' + name + ' ' + value)
+            timezone = system.findtext('./timezone', default='').strip()
+            if re.fullmatch(r'[A-Za-z0-9_./+-]{1,64}', timezone):
+                facts.append('system timezone ' + timezone)
+            for server in ('primary', 'secondary'):
+                address = system.findtext('./ntp-servers/' + server + '-ntp-server/ntp-server-address', default='').strip()
+                if address and re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}', address):
+                    facts.append('system ntp ' + server + ' ' + address)
         settings = device.find('./deviceconfig/setting/management')
         if settings is not None:
             value = settings.findtext('./idle-timeout', default='').strip()
@@ -319,37 +536,85 @@ def extract_palo_config(raw):
                 value = settings.findtext('./admin-lockout/' + name, default='').strip()
                 if re.fullmatch(r'\d{1,5}', value):
                     facts.append('management admin-lockout ' + name + ' ' + value)
+        network = device.find('./network')
+        if network is not None:
+            for entry in network.findall('./profiles/interface-management-profile/entry'):
+                profile = entry.get('name', '')
+                if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', profile):
+                    continue
+                facts.append('interface-management-profile ' + profile + ' configured')
+                for service in ('ssh', 'telnet', 'http', 'https', 'snmp', 'ping'):
+                    value = entry.findtext('./' + service, default='').strip().lower()
+                    if value in ('yes', 'no'):
+                        facts.append('interface-management-profile ' + profile + ' ' + service + ' ' + value)
+                for ip_entry in entry.findall('./permitted-ip/entry'):
+                    address = ip_entry.get('name', '')
+                    try:
+                        if '%' in address or any(ord(c) < 32 or ord(c) == 127 for c in address):
+                            continue
+                        ipaddress.ip_network(address, strict=False)
+                    except ValueError:
+                        continue
+                    facts.append('interface-management-profile ' + profile + ' permitted-ip ' + address)
+            for family in ('ethernet', 'aggregate-ethernet', 'vlan', 'loopback', 'tunnel'):
+                for interface in network.findall('./interface/' + family + '/entry'):
+                    name = interface.get('name', '')
+                    if not re.fullmatch(r'[A-Za-z0-9_.:/-]{1,64}', name):
+                        continue
+                    for child in (interface, *interface.findall('./layer3/units/entry'), *interface.findall('./units/entry')):
+                        child_name = child.get('name', name)
+                        if not re.fullmatch(r'[A-Za-z0-9_.:/-]{1,64}', child_name):
+                            continue
+                        profile = (child.findtext('./layer3/interface-management-profile', default='') or
+                                   child.findtext('./interface-management-profile', default='')).strip()
+                        if re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', profile):
+                            facts.append('interface ' + child_name + ' management-profile ' + profile)
+        for log_type in ('system', 'config'):
+            for rule in device.findall('./log-settings/' + log_type + '/match-list/entry'):
+                for member in rule.findall('./send-syslog/member'):
+                    profile = (member.text or '').strip()
+                    if re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', profile):
+                        facts.append(log_type + ' log forwarding syslog-profile ' + profile)
     return facts, accounts
 
-def _read_until_prompt(channel, timeout, cancelled, expected_prompt=None):
+def _read_until_prompt(channel, timeout, cancelled, expected_prompt=None, platform='cisco', command=None):
     deadline = time.monotonic() + timeout
     data = bytearray()
     prompt_candidate_since = None
+    unexpected_prompt = False
     while time.monotonic() < deadline:
         if cancelled():
-            raise InterruptedError('Dibatalkan')
+            raise InterruptedError('Cancelled')
         if channel.recv_ready():
             chunk = channel.recv(65536)
             if not chunk:
                 break
             data.extend(chunk)
             prompt_candidate_since = None
+            unexpected_prompt = False
             if len(data) > MAX_OUTPUT:
-                raise ValueError('Output exceeded the size limit.')
-            text = data.decode('utf-8', 'replace').replace('\r', '')
-            if re.search(r'--more--', text[-100:], re.I):
-                channel.sendall(' ')
-                data = bytearray(re.sub(r'--more--', '', text, flags=re.I).encode())
-            else:
-                last = text.splitlines()[-1].strip() if text.splitlines() else ''
-                if PROMPT.fullmatch(last) and (expected_prompt is None or last == expected_prompt):
-                    prompt_candidate_since = time.monotonic()
+                raise SessionSyncError('Output exceeded the size limit; collection stopped before sending another command.')
+            raw_text = data.decode('utf-8', 'replace')
+            # No terminal key or CLI setting is sent to advance a pager: only
+            # the literal show-command allowlist may write to the SSH channel.
+            if re.search(r'--\s*more\s*--', raw_text[-256:], re.I):
+                raise SessionSyncError('Paginated output cannot be collected with show-only commands.')
+            text = _terminal_text(raw_text)
+            last = _last_prompt(text)
+            if _prompt_matches(last, expected_prompt, platform):
+                prompt_candidate_since = time.monotonic()
+            elif expected_prompt is not None and _prompt_identity(last, platform) is not None:
+                prompt_candidate_since = time.monotonic()
+                unexpected_prompt = True
         elif prompt_candidate_since is not None and time.monotonic() - prompt_candidate_since >= .3:
-            return data.decode('utf-8', 'replace').replace('\r', '')
+            if unexpected_prompt:
+                raise SessionSyncError('The device prompt changed unexpectedly; collection stopped before sending another command.')
+            return _terminal_text(bytes(data))
         elif channel.closed:
             break
         time.sleep(.05)
-    raise TimeoutError('The device prompt was not detected before the timeout.')
+    phase = ' after ' + command if command else ' after login'
+    raise TimeoutError('The device prompt was not detected' + phase + ' before the timeout. Check output paging, command duration, and custom prompts.')
 
 
 def collect(target, approved, cancelled, update, legacy=False, platform='cisco', on_event=None):
@@ -390,21 +655,32 @@ def collect(target, approved, cancelled, update, legacy=False, platform='cisco',
         channel = client.invoke_shell(width=200, height=1000)
         # Bound write waits as well as reads; a disconnected peer must not hang a worker.
         channel.settimeout(10)
-        greeting = _read_until_prompt(channel, 15, cancelled)
-        prompt = greeting.splitlines()[-1].strip()
-        if platform == 'paloalto' and (not prompt.endswith('>') or '@' not in prompt):
-            raise ValueError('PAN-OS operational mode could not be verified.')
+        greeting = _read_until_prompt(channel, 15, cancelled, None, platform)
+        prompt = _last_prompt(greeting)
+        if _prompt_identity(prompt, platform) is None or (platform == 'paloalto' and not prompt.endswith('>')):
+            message = 'PAN-OS operational-mode prompt' if platform == 'paloalto' else 'Cisco EXEC prompt'
+            raise SessionSyncError(message + ' could not be verified; no command was sent.')
         emit({'type': 'activity', 'message': 'Interactive session is ready. Starting the approved command sequence.'})
-        for command in PLATFORM_COMMANDS[platform]:
+        # A device claims its platform in its first show response. Never infer
+        # command support from the user's platform selector alone.
+        commands = [PLATFORM_COMMANDS[platform][0]]
+        for command in commands:
             if cancelled():
-                raise InterruptedError('Dibatalkan')
+                raise InterruptedError('Cancelled')
             # Only literal constants above can enter the SSH channel.
             emit({'type': 'command_started', 'command': command})
             _send_allowed_show_command(channel, platform, command)
             try:
-                output = _read_until_prompt(channel, 30, cancelled, prompt)
+                output = _read_until_prompt(channel, 30, cancelled, prompt, platform, command)
+                prompt = _last_prompt(output)
                 if re.search(r'(?im)^\s*(?:%\s*)?(?:invalid syntax|unknown command|invalid command|permission denied|not authorized|invalid input|incomplete command|ambiguous command|authorization failed|access denied)', output):
                     raise ValueError('The command is unsupported or the account lacks permission.')
+                if command == PLATFORM_COMMANDS[platform][0]:
+                    extra, skipped = _identity_commands(platform, output, prompt)
+                    commands.extend(extra)
+                    for issue in skipped:
+                        result['issues'].append(issue)
+                        emit({'type': 'issue', 'issue': dict(issue)})
                 if platform == 'paloalto' and command == 'show config running':
                     facts, accounts = extract_palo_config(output)
                     result['facts'] = facts
@@ -435,8 +711,9 @@ def collect(target, approved, cancelled, update, legacy=False, platform='cisco',
                 issue = {'command': command, 'message': str(exc)}
                 result['issues'].append(issue)
                 emit({'type': 'issue', 'issue': dict(issue)})
-                # A timeout or overflow leaves the shell state unknown: never send another command.
-                if isinstance(exc, TimeoutError) or str(exc) == 'Output exceeded the size limit.':
+                # Identity errors and shell-sync errors cannot be followed by
+                # another command without risking an unknown CLI state.
+                if command == PLATFORM_COMMANDS[platform][0] or isinstance(exc, (TimeoutError, SessionSyncError)):
                     break
         result['status'] = 'partial' if result['issues'] else 'completed'
     except UnknownHostKey as exc:
@@ -456,6 +733,10 @@ def collect(target, approved, cancelled, update, legacy=False, platform='cisco',
     except InterruptedError:
         result['status'] = 'cancelled'
         issue = {'command': '', 'message': 'The scan was cancelled; evidence may be incomplete.'}
+        result['issues'].append(issue)
+        emit({'type': 'issue', 'issue': dict(issue)})
+    except SessionSyncError as exc:
+        issue = {'command': '', 'message': str(exc)}
         result['issues'].append(issue)
         emit({'type': 'issue', 'issue': dict(issue)})
     except (socket.error, paramiko.SSHException, TimeoutError, ValueError, EOFError):

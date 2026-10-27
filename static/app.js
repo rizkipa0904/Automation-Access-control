@@ -2,7 +2,8 @@
 const $ = id => document.getElementById(id);
 const token = document.querySelector('meta[name="session-token"]').content;
 let projectId = null, runId = null, polling = false, csvGeneration = 0, currentRun = null, selectedDeviceIndex = 0;
-const openDevices = new Set(), approvedKeys = new Set();
+let rerunSourceId = null, lastProjectsSignature = '', lastRunSignature = '';
+const openDevices = new Set(), approvedKeys = new Set(), openChecklistItems = new Set();
 const setupStorageKey = 'network-access-review-project-setup-v1';
 let projectSetup = {};
 try { projectSetup = JSON.parse(localStorage.getItem(setupStorageKey) || '{}') || {}; } catch (_) { projectSetup = {}; }
@@ -26,7 +27,14 @@ $('platform').onchange = () => { const cisco = $('platform').value === 'cisco'; 
 $('mode').onchange = () => { $('shared').hidden = $('mode').value !== 'shared'; $('individual').hidden = $('mode').value !== 'individual'; rememberProjectSetup(); };
 $('legacy').onchange = rememberProjectSetup;
 $('add').onclick = () => row();
-$('clear').onclick = () => { csvGeneration++; $('csv').value = ''; $('password').value = ''; document.querySelectorAll('#rows input[name=password]').forEach(x => x.value = ''); };
+function clearCredentials() {
+  csvGeneration++;
+  $('csv').value = '';
+  $('username').value = '';
+  $('password').value = '';
+  document.querySelectorAll('#rows input[name=username], #rows input[name=password]').forEach(x => x.value = '');
+}
+$('clear').onclick = clearCredentials;
 function clearProjectInputs() {
   // Never carry targets or credentials from one project's workspace into another.
   csvGeneration++;
@@ -35,6 +43,12 @@ function clearProjectInputs() {
   $('platform').value = ''; $('mode').value = 'shared'; $('legacy').checked = false; $('legacy-option').hidden = true;
   $('shared').hidden = false; $('individual').hidden = true;
   $('error').textContent = '';
+  $('form-error').textContent = '';
+  rerunSourceId = null;
+  $('rerun-context').hidden = true;
+  $('rerun-context').textContent = '';
+  $('devices-title').textContent = 'New scan';
+  $('start').textContent = 'Start review →';
   applyProjectSetup();
 }
 function rememberProjectSetup() {
@@ -56,7 +70,39 @@ function inferProjectSetup(project) {
   const latest = [...project.runs].reverse()[0];
   projectSetup[project.id] = {platform:latest.platform, mode:'shared', legacy:latest.legacy === true};
 }
-$('toggle-new-scan').onclick = () => { $('scan-form').hidden = !$('scan-form').hidden; if (!$('scan-form').hidden) $('scan-form').scrollIntoView({behavior:'smooth',block:'start'}); };
+function showScanForm() {
+  $('scan-form').hidden = false;
+  $('scan-form').scrollIntoView?.({behavior:'smooth', block:'start'});
+}
+function prepareRerun(run, devices) {
+  if (!run || !run.done || run.project_id !== projectId) return;
+  const selected = devices || run.results;
+  if (!selected?.length) return;
+  clearProjectInputs();
+  rerunSourceId = run.id;
+  $('platform').value = run.platform;
+  $('legacy').checked = run.platform === 'cisco' && run.legacy === true;
+  $('legacy-option').hidden = run.platform !== 'cisco';
+  $('mode').value = selected.length > 1 && projectSetup[projectId]?.mode === 'individual' ? 'individual' : 'shared';
+  $('shared').hidden = $('mode').value !== 'shared';
+  $('individual').hidden = $('mode').value !== 'individual';
+  $('ips').value = selected.map(device => `${device.ip},${device.port}`).join('\n');
+  $('rows').replaceChildren();
+  selected.forEach(device => row({ip:device.ip, port:device.port}));
+  const oneDevice = selected.length === 1;
+  $('devices-title').textContent = oneDevice ? 'Rerun device' : 'Rerun scan';
+  $('start').textContent = oneDevice ? 'Start device rerun →' : 'Start scan rerun →';
+  $('rerun-context').textContent = `${oneDevice ? 'One device' : countText(selected.length, 'device')} from scan ${run.id.slice(0, 8)} is ready. Enter SSH credentials again to create a new scan. Passwords are never saved.`;
+  $('rerun-context').hidden = false;
+  showScanForm();
+  if ($('mode').value === 'shared') $('username').focus?.();
+  else document.querySelector('#rows input[name=username]')?.focus?.();
+}
+$('toggle-new-scan').onclick = () => {
+  if (rerunSourceId) { clearProjectInputs(); showScanForm(); return; }
+  $('scan-form').hidden = !$('scan-form').hidden;
+  if (!$('scan-form').hidden) showScanForm();
+};
 function saveBlob(blob, name) { const url=URL.createObjectURL(blob), a=document.createElement('a'); a.href=url; a.download=name; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1000); }
 $('template').onclick=()=>saveBlob(new Blob(['ip,port,username,password\n192.0.2.10,22,auditor1,EXAMPLE_PASSWORD_1\n192.0.2.11,,auditor2,EXAMPLE_PASSWORD_2\n'],{type:'text/csv'}),'devices-template.csv');
 // RFC-style CSV parser supporting quoted commas, quotes and newlines.
@@ -85,7 +131,7 @@ $('csv').onchange = async event => {
   }
 };
 function targets(){if($('mode').value==='shared'){return $('ips').value.split(/\r?\n/).filter(x=>x.trim()).map((line,i)=>{let parts=line.split(',');if(parts.length>2)throw Error(`Row ${i+1}: use IP,port format.`);return {ip:parts[0].trim(),port:(parts[1]||'22').trim(),username:$('username').value,password:$('password').value};});}return [...$('rows').querySelectorAll('tr')].map(tr=>Object.fromEntries([...tr.querySelectorAll('input')].map(x=>[x.name,x.value])));}
-const platformName = value => value === 'cisco' ? 'Cisco IOS / IOS XE' : 'Palo Alto PAN-OS';
+const platformName = value => ({cisco:'Cisco IOS / IOS XE',paloalto:'Palo Alto PAN-OS'})[value] || 'Unknown platform';
 function node(tag, cls, value) { const el = document.createElement(tag); if (cls) el.className = cls; if (value !== undefined) el.textContent = value; return el; }
 function countText(value, singular, plural = `${singular}s`) { return `${value} ${value === 1 ? singular : plural}`; }
 function statusText(value) { return ({queued:'Queued',connecting:'Connecting to SSH',collecting:'Connected · collecting',completed:'Completed',partial:'Partial',failed:'Failed',cancelled:'Cancelled',interrupted:'Interrupted after restart',host_key_unknown:'Host key verification required'})[value] || value; }
@@ -124,6 +170,7 @@ $('create-project').onclick = async () => {
 $('start').onclick = async () => {
   try {
     $('error').textContent = '';
+    $('form-error').textContent = '';
     if (!projectId) throw Error('Create or select a project first.');
     const platform = $('platform').value;
     if (!platform) throw Error('Select a device platform first.');
@@ -131,10 +178,16 @@ $('start').onclick = async () => {
     if (!data.length) throw Error('Enter at least one device.');
     $('start').disabled = true;
     const submittedProject = projectId;
-    const result = await (await post('/runs', {project_id:submittedProject, platform, targets:data, legacy:$('legacy').checked})).json();
-    if (projectId === submittedProject) { runId = result.id; currentRun = null; selectedDeviceIndex = 0; openDevices.clear(); $('scan-form').hidden = true; }
+    const payload = {project_id:submittedProject, platform, targets:data, legacy:$('legacy').checked};
+    if (rerunSourceId) payload.rerun_of = rerunSourceId;
+    const result = await (await post('/runs', payload)).json();
+    if (projectId === submittedProject) { runId = result.id; selectedDeviceIndex = 0; openDevices.clear(); clearRun(); clearProjectInputs(); $('scan-form').hidden = true; }
     await refresh();
-  } catch (e) { $('error').textContent = e.message; }
+  } catch (e) {
+    $('error').textContent = e.message;
+    $('form-error').textContent = e.message;
+    showScanForm();
+  }
   finally { $('start').disabled = false; }
 };
 $('cancel').onclick = async () => {
@@ -148,12 +201,31 @@ $('download').onclick = async () => {
   try { const r = await api(`/runs/${selectedRun}/xlsx`); saveBlob(await r.blob(), `Access_Review_${selectedRun.slice(0,8)}.xlsx`); }
   catch (e) { $('error').textContent = e.message; }
 };
+$('rerun').onclick = () => prepareRerun(currentRun);
+$('delete-run').onclick = async () => {
+  if (!currentRun?.done || !runId) return;
+  const deletedRunId = runId;
+  if (!confirm(`Delete saved scan ${deletedRunId.slice(0, 8)} and its report? This cannot be undone.`)) return;
+  $('delete-run').disabled = true;
+  try {
+    await api(`/runs/${deletedRunId}`, {method:'DELETE'});
+    if (runId === deletedRunId) {
+      runId = null;
+      clearRun();
+      if (rerunSourceId === deletedRunId) clearProjectInputs();
+    }
+    await refresh();
+  } catch (e) { $('error').textContent = e.message; $('delete-run').disabled = false; }
+};
 function renderProjects(projects) {
+  const focused=document.activeElement;
+  const focusedProject=focused?.getAttribute?.('data-project-id');
+  const focusedScan=focused?.getAttribute?.('data-run-id');
   const list = $('projects'); list.replaceChildren();
   if (!projects.length) list.append(node('p','empty-state','No projects yet. Create one to get started.'));
   for (const project of projects) {
     const b = node('button', 'project-item' + (project.id === projectId ? ' selected' : ''));
-    b.type = 'button'; b.setAttribute('aria-pressed', String(project.id === projectId));
+    b.type = 'button'; b.setAttribute('aria-pressed', String(project.id === projectId)); b.setAttribute('data-project-id',project.id);
     b.append(node('strong', '', project.name), node('span', '', `${countText(project.runs.length, 'scan')} · ${project.runs.filter(r => !r.done).length} running`));
     b.onclick = () => { if (projectId !== project.id) selectProject(project); refresh(); };
     list.append(b);
@@ -165,12 +237,14 @@ function renderProjects(projects) {
   if (!project || !project.runs.length) scans.append(node('p', 'empty-state', project ? 'No scans yet. Use the New scan form.' : 'Select a project to see its scans.'));
   if (project) for (const run of [...project.runs].reverse()) {
     const b = node('button', 'scan-item' + (run.id === runId ? ' selected' : '')); b.type = 'button';
-    b.setAttribute('aria-pressed', String(run.id === runId));
+    b.setAttribute('aria-pressed', String(run.id === runId)); b.setAttribute('data-run-id',run.id);
     const head = node('div','scan-head'); head.append(node('strong','',platformName(run.platform)), node('span', 'badge', runStatus(run.done, run.counts || {})));
-    b.append(head, node('span','scan-meta',`${countText(run.total, 'device')} · ${run.started} · ${run.id.slice(0,8)}`));
+    b.append(head, node('span','scan-meta',`${countText(run.total, 'device')} · ${run.started} · ${run.id.slice(0,8)}${run.rerun_of ? ` · rerun of ${run.rerun_of.slice(0,8)}` : ''}`));
     b.onclick = () => { if (runId !== run.id) { runId = run.id; currentRun = null; selectedDeviceIndex = 0; openDevices.clear(); clearRun(); } refresh(); };
     scans.append(b);
   }
+  if (focusedProject) list.querySelector?.(`.project-item[data-project-id="${focusedProject}"]`)?.focus?.({preventScroll:true});
+  if (focusedScan) scans.querySelector?.(`.scan-item[data-run-id="${focusedScan}"]`)?.focus?.({preventScroll:true});
 }
 function timeLabel(value) { return value && value.length >= 19 ? value.slice(11,19) : '--:--:--'; }
 function renderAccessChecks(run, device) {
@@ -178,6 +252,10 @@ function renderAccessChecks(run, device) {
   section.append(node('div','preview-heading','ACCESS CONTROL REVIEW'));
   const facts=device.facts||[], accounts=device.accounts||[];
   const add=(label,value,state='Observed')=>{const row=node('div','access-check');row.append(node('strong','',label),node('span','check-status '+state.toLowerCase().replaceAll(' ','-'),state),node('p','',value));section.append(row);};
+  if (!run.done && ['queued','connecting','collecting'].includes(device.status) && !facts.length && !accounts.length && !(device.evidence||[]).length) {
+    section.append(node('p','access-pending','Checks will appear as read-only evidence is collected.'));
+    return section;
+  }
   if(run.platform==='cisco') {
     const users=accounts.map(a=>`${a.username} · privilege ${a.privilege||'unspecified'}`).join('\n');
     add('Local configured accounts',users||'No local account entries could be extracted.',users?'Observed':'Not available');
@@ -189,7 +267,7 @@ function renderAccessChecks(run, device) {
     add('SSH service',ssh?.text||'SSH state was not available from the collected output.',ssh&&!ssh.text.startsWith('[')?'Observed':'Not available');
     const ext=facts.filter(f=>/^(aaa (authentication|authorization|accounting)|aaa group server|radius server|tacacs server)/i.test(f));
     add('MFA enforcement',ext.length?`External AAA references were observed (${ext.length}). The RADIUS/TACACS+ provider policy and any second-factor challenge were not checked.`:'No external RADIUS/TACACS+ reference was extracted. MFA state cannot be determined from this device snapshot.','Not verified');
-  } else {
+  } else if (run.platform==='paloalto') {
     const admins=accounts.map(a=>`${a.username} · ${a.privilege||'role unknown'}${a.source==='show admins all'?' · known to device':''}`).join('\n');
     add('Administrators known to the device',admins||'No administrator names were extracted.');
     const auth=facts.filter(f=>/^(admin .* (role|authentication-profile)|authentication-profile )/i.test(f)).join('\n');
@@ -203,10 +281,37 @@ function renderAccessChecks(run, device) {
   }
   return section;
 }
+function renderChecklist(run, device, index) {
+  if (!Array.isArray(device.checklist) || !device.checklist.length) return null;
+  if (['queued','connecting','collecting'].includes(device.status) && !(device.evidence||[]).length && !(device.facts||[]).length && !(device.accounts||[]).length) return null;
+  const section=node('section','control-checklist');
+  const heading=node('div','checklist-heading');
+  heading.append(node('div','preview-heading','CONTROL CHECKLIST'),node('span','checklist-count',`${countText(device.checklist.length,'control')}${['queued','connecting','collecting'].includes(device.status)?' · updating':''}`));
+  section.append(heading);
+  device.checklist.forEach((entry,position)=>{
+    const id=String(entry.id||`Item ${position+1}`);
+    const status=String(entry.status||'Not collected');
+    const key=`${run.id}:${index}:${id}`;
+    const item=node('details','checklist-item');
+    item.open=openChecklistItems.has(key);
+    item.ontoggle=()=>{ if (item.open) openChecklistItems.add(key); else openChecklistItems.delete(key); };
+    const summary=node('summary','checklist-summary');
+    summary.setAttribute('data-focus-key',`checklist-${position}`);
+    summary.append(node('strong','checklist-id',id),node('span','checklist-area',entry.area||'Access control'),node('span',`checklist-status status-${status.toLowerCase().replace(/[^a-z]+/g,'-')}`,status));
+    const content=node('div','checklist-content');
+    content.append(node('strong','', 'Observation'),node('p','',entry.observation||'No observation was collected.'));
+    content.append(node('strong','', 'Follow-up'),node('p','',entry.follow_up||'Review this control with an authorized operator.'));
+    if (Array.isArray(entry.evidence_ids) && entry.evidence_ids.length) content.append(node('span','checklist-evidence',`Evidence: ${entry.evidence_ids.join(', ')}`));
+    item.append(summary,content);
+    section.append(item);
+  });
+  return section;
+}
 function renderDeviceDetail(run, device, index) {
   const panel = node('section','device-detail');
   const title = node('div','detail-heading');
-  title.append(node('div','terminal-state',`${device.ip}:${device.port} · ${statusText(device.status)}`), node('span','terminal-live-badge',run.done ? 'Saved activity' : 'LIVE'));
+  const live = !run.done && ['queued','connecting','collecting'].includes(device.status);
+  title.append(node('div','terminal-state',`${device.ip}:${device.port} · ${statusText(device.status)}`), node('span','terminal-live-badge'+(live?' live':''),live ? (device.status==='queued'?'QUEUED':'LIVE') : 'SAVED ACTIVITY'));
   panel.append(title);
   const activity = device.activity || [];
   const terminal = node('div','terminal-output');
@@ -222,46 +327,72 @@ function renderDeviceDetail(run, device, index) {
   panel.append(terminal, node('p','terminal-footnote','Commands are shown as they run. Device output appears only after sensitive values are filtered.'));
   const detail = node('div','device-body');
   detail.append(renderAccessChecks(run,device));
+  const checklist=renderChecklist(run,device,index);
+  if (checklist) detail.append(checklist);
   for (const issue of device.issues || []) detail.append(node('p','issue',`${issue.command ? issue.command+': ' : ''}${issueText(issue.message)}`));
   if (device.host_key) {
     detail.append(node('p','host-warning','Verify this fingerprint through a trusted source before approving it.'),node('p','key',`${device.host_key.type} · ${device.host_key.fingerprint}`));
     const endpoint=device.port===22?device.ip:`[${device.ip}]:${device.port}`, approved=`${run.id}:${endpoint}`;
-    const btn=node('button','secondary',approvedKeys.has(approved)?'Verified for this session':'I verified this fingerprint'); btn.disabled=approvedKeys.has(approved);
+    const btn=node('button','secondary',approvedKeys.has(approved)?'Verified for this session':'I verified this fingerprint'); btn.disabled=approvedKeys.has(approved); btn.type='button'; btn.setAttribute('data-focus-key','approve');
     btn.onclick=async()=>{try{await post('/approve-key',{run_id:run.id,endpoint,fingerprint:device.host_key.fingerprint});approvedKeys.add(approved);btn.disabled=true;btn.textContent='Verified. Start a new scan for this target.';}catch(e){$('error').textContent=e.message;}}; detail.append(btn);
   }
   const evidence=device.evidence||[];
   detail.append(node('div','preview-heading','FILTERED ACCESS CONTROL EVIDENCE'));
   if (!evidence.length) detail.append(node('p','empty-state','No filtered evidence is available yet.'));
   for (const item of evidence) { const block=node('div','evidence-block'); block.append(node('div','evidence-command',item.command),node('pre','evidence-text',item.text||'No approved fields found.')); detail.append(block); }
+  if (run.done) {
+    const actions=node('div','device-actions');
+    const rerun=node('button','secondary device-rerun','Rerun this device');
+    rerun.type='button'; rerun.setAttribute('data-focus-key','rerun'); rerun.onclick=()=>prepareRerun(run,[device]);
+    actions.append(rerun); detail.append(actions);
+  }
   panel.append(detail);
   return panel;
 }
 function renderRun(run) {
+  const container=$('results');
+  const oldSelection=container.querySelector?.('.device-row-wrap.selected');
+  const oldSelectedIndex=oldSelection?.getAttribute('data-device-index');
+  const oldTerminal=oldSelection?.querySelector('.terminal-output');
+  const oldScrollTop=oldTerminal?.scrollTop ?? 0;
+  const followTail=oldTerminal ? oldTerminal.scrollHeight-oldTerminal.clientHeight-oldScrollTop <= 32 : false;
+  const active=document.activeElement;
+  const activeWrap=active?.closest?.('.device-row-wrap');
+  const focusIndex=activeWrap?.getAttribute('data-device-index');
+  const focusKey=active?.getAttribute?.('data-focus-key');
   currentRun = run;
+  lastRunSignature = JSON.stringify(run);
+  if (selectedDeviceIndex >= run.results.length) selectedDeviceIndex = 0;
   const counts = run.results.reduce((c,r)=>(c[r.status]=(c[r.status]||0)+1,c),{});
   const inProgress = (counts.queued||0)+(counts.connecting||0)+(counts.collecting||0);
-  const failed = (counts.failed||0)+(counts.host_key_unknown||0)+(counts.interrupted||0);
   const done = counts.completed||0;
+  const attention = run.results.length-inProgress-done;
   $('summary').textContent = `${countText(run.results.length,'device')} · ${runStatus(run.done, counts)} · ${platformName(run.platform)} · started ${run.started}`;
-  $('download').disabled = !run.done; $('cancel').disabled = run.done;
+  $('download').disabled = !run.done; $('rerun').disabled = !run.done || !run.results.length;
+  $('cancel').disabled = run.done; $('delete-run').disabled = !run.done;
   const cards=$('status-cards'); cards.replaceChildren();
-  for (const [label,value,cls] of [['Total devices',run.results.length,'total'],['In progress',inProgress,'progress'],['Failed',failed,'failed'],['Done',done,'done']]) {const card=node('div',`status-card ${cls}`);card.append(node('span','',label),node('strong','',String(value)));cards.append(card);}
-  const container=$('results'); container.replaceChildren();
+  for (const [label,value,cls] of [['Total devices',run.results.length,'total'],['In progress',inProgress,'progress'],['Needs attention',attention,'failed'],['Done',done,'done']]) {const card=node('div',`status-card ${cls}`);card.append(node('span','',label),node('strong','',String(value)));cards.append(card);}
+  container.replaceChildren();
   if (!run.results.length) {container.append(node('p','empty-state','No devices are attached to this scan.'));return;}
   run.results.forEach((x,index)=>{
     const wrap=node('div','device-row-wrap'+(index===selectedDeviceIndex?' selected':''));
-    const b=node('button','device-row'); b.type='button'; b.setAttribute('aria-pressed',String(index===selectedDeviceIndex));
-    const progress=x.current_command ? `SSH connected → ${x.current_command} ${x.status==='completed'?'done':'in progress'}` : x.status==='completed' ? 'SSH connected → access control review done' : statusText(x.status);
-    b.append(node('strong','device-address',`${x.ip}:${x.port}`),node('span','device-progress',progress),node('span','badge',statusText(x.status)));
+    wrap.setAttribute('data-device-index',String(index));
+    const b=node('button','device-row'); b.type='button'; b.setAttribute('aria-pressed',String(index===selectedDeviceIndex)); b.setAttribute('data-focus-key','row');
+    const progress=x.status==='collecting' ? (x.current_command ? `SSH connected → ${x.current_command} in progress` : 'SSH connected → collecting read-only evidence') : x.status==='completed' ? 'Access control review done' : x.status==='partial' ? 'Partial evidence collected · review issues' : statusText(x.status);
+    b.append(node('strong','device-address',`${x.ip}:${x.port}`),node('span','device-progress',progress),node('span',`badge status-${x.status}`,statusText(x.status)));
     b.onclick=()=>{selectedDeviceIndex=index;renderRun(run);}; wrap.append(b);
     if(index===selectedDeviceIndex) wrap.append(renderDeviceDetail(run,x,index));
     container.append(wrap);
   });
+  const nextTerminal=container.querySelector?.('.device-row-wrap.selected .terminal-output');
+  if (nextTerminal && oldTerminal && oldSelectedIndex===String(selectedDeviceIndex)) nextTerminal.scrollTop=followTail ? nextTerminal.scrollHeight : oldScrollTop;
+  if (focusIndex!==undefined && focusKey) container.querySelector?.(`.device-row-wrap[data-device-index="${focusIndex}"] [data-focus-key="${focusKey}"]`)?.focus?.({preventScroll:true});
 }
 function clearRun() {
   currentRun = null;
+  lastRunSignature = '';
   $('summary').textContent = 'Select a project and scan to view device activity.';
-  $('results').replaceChildren(); $('status-cards').replaceChildren(); $('download').disabled = true; $('cancel').disabled = true;
+  $('results').replaceChildren(); $('status-cards').replaceChildren(); $('download').disabled = true; $('rerun').disabled = true; $('cancel').disabled = true; $('delete-run').disabled = true;
 }
 async function refresh() {
   if (polling) return;
@@ -280,11 +411,19 @@ async function refresh() {
       clearProjectInputs();
       if (runId) $('scan-form').hidden = true;
     }
-    renderProjects(projects);
+    const selectedProject=projects.find(p=>p.id===projectId);
+    if (selectedProject && (!runId || !selectedProject.runs.some(run=>run.id===runId))) {
+      const available=[...selectedProject.runs].reverse();
+      runId=(available.find(run=>!run.done)||available[0]||{}).id||null;
+      selectedDeviceIndex=0;
+      clearRun();
+    }
+    const projectsSignature=JSON.stringify([projects,projectId,runId]);
+    if (projectsSignature!==lastProjectsSignature) { renderProjects(projects); lastProjectsSignature=projectsSignature; }
     const selectedRunId = runId;
     if (selectedRunId) {
       const run = await (await api(`/runs/${selectedRunId}`)).json();
-      if (runId === selectedRunId && projectId === run.project_id) renderRun(run);
+      if (runId === selectedRunId && projectId === run.project_id && JSON.stringify(run)!==lastRunSignature) renderRun(run);
     } else { clearRun(); const project=projects.find(p=>p.id===projectId); $('selected-project').textContent=project?project.name:'Select a project'; $('summary').textContent=project?'No scan yet. Create a new scan to start reviewing devices.':'Choose a project to view its access review status.'; }
   } catch (e) { $('error').textContent = e.message; }
   finally { polling = false; }
