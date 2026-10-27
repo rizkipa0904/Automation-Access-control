@@ -72,7 +72,7 @@ At most five SSH connections run concurrently across all projects. Additional ta
 
 ## What the audit collects
 
-Only fixed, read-only commands are sent. A command failure, unsupported output, insufficient privilege, or parser mismatch is recorded as a collection issue; the app does not fall back to arbitrary commands.
+**The device command channel is restricted to the literal `show ...` commands listed below.** No `configure`, `set`, `delete`, `commit`, `clear`, `request`, or other operational/configuration command is sent. The only other terminal input is a space character to advance a paginated read-only response. A command failure, unsupported output, insufficient privilege, or parser mismatch is recorded as a collection issue; the app does not fall back to arbitrary commands.
 
 ### Cisco IOS / IOS XE
 

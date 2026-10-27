@@ -201,6 +201,23 @@ tacacs server TAC-1
         self.assertNotIn('secret', sanitize_show('show users', 'secret'))
         self.assertNotIn('secret', sanitize_show('show ip ssh', 'unrecognized secret'))
 
+    def test_command_sender_rejects_everything_except_literal_show_allowlist(self):
+        from cisco_audit.core import PLATFORM_COMMANDS, _send_allowed_show_command
+        class Channel:
+            def __init__(self): self.sent=[]
+            def sendall(self, data): self.sent.append(data)
+        channel=Channel()
+        for platform, commands in PLATFORM_COMMANDS.items():
+            for command in commands:
+                self.assertTrue(command.startswith('show '))
+                _send_allowed_show_command(channel, platform, command)
+        for platform in PLATFORM_COMMANDS:
+            for command in ('configure terminal','clear counters','set system setting','show version\nconfigure terminal','show version; clear counters','request restart system'):
+                with self.assertRaises(ValueError):
+                    _send_allowed_show_command(channel, platform, command)
+        self.assertEqual(len(channel.sent), sum(map(len, PLATFORM_COMMANDS.values())))
+        self.assertTrue(all(data.startswith('show ') and data.endswith('\n') for data in channel.sent))
+
 if __name__ == '__main__':
     unittest.main()
 

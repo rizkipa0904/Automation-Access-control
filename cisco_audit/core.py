@@ -25,6 +25,15 @@ PLATFORM_COMMANDS = {'cisco': COMMANDS, 'paloalto': PALO_COMMANDS}
 MAX_OUTPUT = 2_000_000
 PROMPT = re.compile(r'^[A-Za-z0-9_.:@/-]{1,120}[#>]\s*$')
 
+
+def _send_allowed_show_command(channel, platform, command):
+    """Send only one literal, platform-specific show command to the device."""
+    allowed = PLATFORM_COMMANDS.get(platform, ())
+    if (command not in allowed or not isinstance(command, str)
+            or not command.startswith('show ') or any(c in command for c in '\r\n;')):
+        raise ValueError('Blocked non-allowlisted or non-read-only device command.')
+    channel.sendall(command + '\n')
+
 class UnknownHostKey(Exception):
     def __init__(self, key):
         self.key = key
@@ -391,7 +400,7 @@ def collect(target, approved, cancelled, update, legacy=False, platform='cisco',
                 raise InterruptedError('Dibatalkan')
             # Only literal constants above can enter the SSH channel.
             emit({'type': 'command_started', 'command': command})
-            channel.sendall(command + '\n')
+            _send_allowed_show_command(channel, platform, command)
             try:
                 output = _read_until_prompt(channel, 30, cancelled, prompt)
                 if re.search(r'(?im)^\s*(?:%\s*)?(?:invalid syntax|unknown command|invalid command|permission denied|not authorized|invalid input|incomplete command|ambiguous command|authorization failed|access denied)', output):
