@@ -9,8 +9,19 @@ import xml.etree.ElementTree as ET
 
 import paramiko
 
-COMMANDS = ('show version', 'show inventory', 'show privilege', 'show ip ssh',
-            'show users', 'show ssh', 'show running-config')
+# Critical evidence runs before the optional session check. Cisco show users
+# is intentionally excluded: some IOS releases perform a reverse DNS lookup
+# that can pause for about a minute, and its session output was never exported.
+COMMANDS = ('show version', 'show running-config', 'show inventory', 'show privilege',
+            'show ip ssh', 'show ssh')
+COMMAND_TIMEOUT = 30
+LARGE_CONFIG_TIMEOUT = 60
+SESSION_COMMAND_TIMEOUT = 10
+COMMAND_TIMEOUTS = {
+    'show running-config': LARGE_CONFIG_TIMEOUT,
+    'show config running': LARGE_CONFIG_TIMEOUT,
+    'show ssh': SESSION_COMMAND_TIMEOUT,
+}
 # Keep SHA-1 key exchange/host signatures and CBC ciphers out of the default
 # profile. The legacy profile uses Paramiko's available algorithms, including
 # older SSHv2 algorithms; it never bypasses host-key verification.
@@ -90,6 +101,11 @@ def _prompt_identity(prompt, platform):
         match = PALO_PROMPT.fullmatch(prompt)
         return match.group('identity') if match else None
     return prompt if CISCO_PROMPT.fullmatch(prompt) else None
+
+
+def _command_timeout(command):
+    """Large configuration reads and the optional session check use tuned limits."""
+    return COMMAND_TIMEOUTS.get(command, COMMAND_TIMEOUT)
 
 
 def _command_failed(output, prompt):
@@ -277,9 +293,25 @@ def extract_config(raw):
     """Strict allowlist of useful facts; never preserve arbitrary configuration lines."""
     facts, accounts = [], []
     context = ''
+    banner_end = None
     for line in raw.splitlines():
         s = line.strip()
-        if not line.startswith((' ', '\t')):
+        if banner_end is not None:
+            # Banner text is free-form and may contain lines that look like
+            # configuration. Skip it until the closing delimiter.
+            if banner_end in line:
+                banner_end = None
+            continue
+        top_level = not line.startswith((' ', '\t'))
+        if top_level:
+            banner = re.match(r'^banner\s+\S+\s+(\S.*)$', s, re.I)
+            if banner:
+                rest = banner.group(1)
+                # IOS prints Ctrl-C as the two characters ^C.
+                delimiter = rest[:2] if rest.startswith('^') and len(rest) > 1 and rest[1].isalpha() else rest[:1]
+                if delimiter not in rest[len(delimiter):]:
+                    banner_end = delimiter
+                continue
             if re.fullmatch(r'line (?:vty [0-9 ]+|con(?:sole)? \d+|aux \d+)', s, re.I):
                 context = s
             elif re.fullmatch(r'(?:ip access-list (?:standard|extended)|ipv6 access-list) [A-Za-z0-9_.-]{1,64}', s, re.I):
@@ -300,17 +332,19 @@ def extract_config(raw):
             else:
                 context = ''
         m = re.match(r'^username\s+(\S+)(?:\s+privilege\s+(\d+))?', s, re.I)
-        if m:
+        if top_level and m:
             # Username is potentially attacker-controlled; limit its character set.
+            # Indented lines such as the username entry under ip ssh pubkey-chain
+            # are not local accounts and must not be inventoried as such.
             name = m.group(1)
             if re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', name):
                 accounts.append({'username': name, 'privilege': m.group(2) or 'unspecified'})
             continue
-        if re.match(r'^enable secret(?:\s|$)', s, re.I):
-            facts.append('enable secret configured [value hidden]')
-            continue
-        if re.match(r'^enable password(?:\s|$)', s, re.I):
-            facts.append('enable password configured [value hidden]')
+        enable_match = re.match(
+            r'^enable (?:algorithm-type \S+ )?(?:level \d{1,2} )?(secret|password)(?: level \d{1,2})?(?:\s|$)',
+            s, re.I)
+        if top_level and enable_match:
+            facts.append('enable ' + enable_match.group(1).lower() + ' configured [value hidden]')
             continue
         # Preserve the VTY range on every fact: the method-list reference is
         # meaningful only together with the lines on which it is configured.
@@ -372,6 +406,8 @@ def extract_config(raw):
                     facts.append(match.group(1).lower() + ' host ' + address)
         elif _safe_aaa_fact(s):
             facts.append(s)
+        elif re.fullmatch(r'(?:no )?ip domain[- ]lookup', s, re.I):
+            facts.append(s)
         elif re.fullmatch(r'ip ssh version [12]', s, re.I):
             facts.append(s)
         elif re.fullmatch(r'ip ssh (?:time-out|authentication-retries) \d{1,5}', s, re.I):
@@ -391,7 +427,7 @@ def extract_config(raw):
             facts.append(s)
         elif re.fullmatch(r'login quiet-mode access-class [A-Za-z0-9_.-]{1,64}', s, re.I):
             facts.append(s)
-        elif re.fullmatch(r'login on-(?:failure|success) log', s, re.I):
+        elif re.fullmatch(r'login on-(?:failure|success) log(?: every \d{1,5} within \d{1,5})?', s, re.I):
             facts.append(s)
         elif re.fullmatch(r'(?:no )?ip http (?:server|secure-server)', s, re.I):
             facts.append(s)
@@ -409,7 +445,7 @@ def extract_config(raw):
             facts.append(s)
         elif re.fullmatch(r'(?:no )?logging on', s, re.I):
             facts.append(s)
-        elif re.fullmatch(r'(?:no )?logging buffered(?: \d{1,10})?', s, re.I):
+        elif re.fullmatch(r'(?:no )?logging buffered(?: \d{1,10})?(?: (?:emergencies|alerts|critical|errors|warnings|notifications|informational|debugging|[0-7]))?', s, re.I):
             facts.append(s)
         elif re.fullmatch(r'(?:no )?logging (?:console|monitor)(?: (?:emergencies|alerts|critical|errors|warnings|notifications|informational|debugging|[0-7]))?', s, re.I):
             facts.append(s)
@@ -503,6 +539,10 @@ def sanitize_palo_info(raw):
     return '\n'.join(lines) or '[Device identity could not be extracted.]'
 
 
+def _valid_admin_name(value):
+    return bool(re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', value) and re.search(r'[A-Za-z0-9]', value))
+
+
 def _admin_column_ok(value):
     """Accept only values that resemble a known PAN-OS administrator column."""
     value = value.strip()
@@ -533,7 +573,10 @@ def extract_palo_admins(raw, prompt):
             continue
         if re.fullmatch(r'(?:\S*[>#]\s*)?show admins all', line, re.I):
             continue
-        if re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', line):
+        if re.fullmatch(r'[-=+_| ]{2,}', line):
+            # Table separator such as ---- or ====.
+            continue
+        if _valid_admin_name(line):
             if line.lower() not in ('administrator', 'administrators', 'username', 'name'):
                 names.append(line)
             continue
@@ -542,12 +585,13 @@ def extract_palo_admins(raw, prompt):
                 and all(column.lower() in ADMIN_HEADER_WORDS for column in columns)):
             # Table heading, not an administrator entry.
             continue
-        if (len(columns) >= 2 and columns[0].lower() in ('total', 'count', 'summary', 'number')):
+        if (len(columns) >= 2
+                and re.fullmatch(r'(?:total|count|summary|number):?', columns[0], re.I)):
             # A count/summary line is not an administrator entry.
             continue
         if (len(columns) >= 2
                 and not columns[0].isdigit()
-                and re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', columns[0])
+                and _valid_admin_name(columns[0])
                 and all(_admin_column_ok(column) for column in columns[1:])):
             names.append(columns[0])
             continue
@@ -566,6 +610,9 @@ def extract_palo_config(raw):
     start = re.search(r'<config(?:\s[^>]*)?>', raw)
     end = raw.rfind('</config>')
     if not start or end < start.start():
+        if re.search(r'(?m)^\s*(?:set|delete)\s+\S+', raw):
+            raise ValueError('The PAN-OS configuration output is in set format; XML output is required. '
+                             'Check the CLI config-output-format setting for the read-only account.')
         raise ValueError('The PAN-OS configuration format is unrecognized or incomplete.')
     try:
         root = ET.fromstring(raw[start.start():end + len('</config>')])
@@ -823,7 +870,9 @@ def collect(target, approved, cancelled, update, legacy=False, platform='cisco',
         client.connect(target['ip'], port=target['port'], username=target['username'], password=target['password'], timeout=10, banner_timeout=10, auth_timeout=10, look_for_keys=False, allow_agent=False, disabled_algorithms={} if legacy else MODERN_DISABLED)
         emit({'type': 'activity', 'message': 'SSH connection authenticated; preparing the interactive read-only session.'})
         update('collecting')
-        channel = client.invoke_shell(width=200, height=1000)
+        # A wide pseudo-terminal reduces line wrapping in running-config and
+        # PAN-OS XML output; the height is a paging hint where supported.
+        channel = client.invoke_shell(width=512, height=1000)
         # Bound write and read waits; a disconnected peer must not hang a
         # worker, while the per-command deadline remains the primary limit.
         channel.settimeout(30)
@@ -843,7 +892,7 @@ def collect(target, approved, cancelled, update, legacy=False, platform='cisco',
             emit({'type': 'command_started', 'command': command})
             _send_allowed_show_command(channel, platform, command)
             try:
-                output = _read_until_prompt(channel, 30, cancelled, prompt, platform, command)
+                output = _read_until_prompt(channel, _command_timeout(command), cancelled, prompt, platform, command)
                 prompt = _last_prompt(output)
                 if _command_failed(output, prompt):
                     raise ValueError('The command is unsupported or the account lacks permission.')
@@ -880,7 +929,11 @@ def collect(target, approved, cancelled, update, legacy=False, platform='cisco',
                 result['evidence'].append(entry)
                 emit({'type': 'evidence', 'evidence': dict(entry)})
             except (TimeoutError, ValueError) as exc:
-                issue = {'command': command, 'message': str(exc)}
+                message = str(exc)
+                if isinstance(exc, TimeoutError) and command == 'show ssh':
+                    message = ('show ssh did not return a prompt in time; this optional session check was skipped '
+                               'and earlier evidence is retained.')
+                issue = {'command': command, 'message': message}
                 result['issues'].append(issue)
                 emit({'type': 'issue', 'issue': dict(issue)})
                 # Identity errors and shell-sync errors cannot be followed by

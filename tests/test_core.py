@@ -247,6 +247,8 @@ class PaloTests(unittest.TestCase):
                'admin   103.0.0.5   CLI      06/06 15:06:09     00:00:00s\n'
                'remote-admin   -    API      -                  -\n'
                'auditor   192.0.2.10   Web\n'
+               '----   ----  ----   ----\n'
+               'Total: 3\n'
                'admin@fw>')
         self.assertEqual(extract_palo_admins(raw, 'admin@fw>'), ['admin', 'remote-admin', 'auditor'])
         with self.assertRaisesRegex(ValueError, 'not recognized'):
@@ -301,6 +303,8 @@ admin@fw>'''
         for raw in ('<config><mgt-config>', '<!DOCTYPE config [<!ENTITY x "secret">]><config><mgt-config><users/></mgt-config></config>', '<config><mgt-config/></config>'):
             with self.assertRaises(ValueError):
                 extract_palo_config(raw)
+        with self.assertRaisesRegex(ValueError, 'set format'):
+            extract_palo_config('set mgt-config users admin phash SECRET')
 
     def test_palo_collection_uses_only_read_commands_and_attributes_evidence(self):
         from cisco_audit import core
@@ -496,6 +500,54 @@ class SessionCompatibilityTests(unittest.TestCase):
         self.assertIn('show ssh', commands)
         self.assertFalse(any(issue['command'] == 'show ssh' for issue in issues))
 
+    def test_command_timeouts_prioritize_large_configs_and_session_checks(self):
+        from cisco_audit.core import COMMANDS, _command_timeout
+        self.assertEqual(_command_timeout('show running-config'), 60)
+        self.assertEqual(_command_timeout('show config running'), 60)
+        self.assertEqual(_command_timeout('show ssh'), 10)
+        self.assertEqual(_command_timeout('show version'), 30)
+        self.assertNotIn('show users', COMMANDS)
+        self.assertEqual(COMMANDS[1], 'show running-config')
+        self.assertEqual(COMMANDS[-1], 'show ssh')
+
+    def test_show_ssh_timeout_keeps_critical_evidence_and_explains_skip(self):
+        from cisco_audit import core
+        class Channel:
+            closed = False
+            def __init__(self): self.sent = []
+            def settimeout(self, value): self.timeout = value
+            def sendall(self, value): self.sent.append(value)
+        class Client:
+            def __init__(self): self.channel = Channel()
+            def load_system_host_keys(self): pass
+            def set_missing_host_key_policy(self, policy): pass
+            def connect(self, *args, **kwargs): pass
+            def invoke_shell(self, **kwargs): return self.channel
+            def close(self): pass
+        client = Client()
+        class FakeParamiko:
+            SSHClient = staticmethod(lambda: client)
+            MissingHostKeyPolicy = type('MissingHostKeyPolicy', (), {})
+            BadHostKeyException = type('BadHostKeyException', (Exception,), {})
+            AuthenticationException = type('AuthenticationException', (Exception,), {})
+            SSHException = type('SSHException', (Exception,), {})
+        outputs = {
+            'show version': 'Cisco IOS XE Software, Version 17.9.4\nswitch#',
+            'show running-config': 'aaa new-model\nline vty 0 4\n transport input ssh\nswitch#',
+        }
+        def read(channel, timeout, cancelled, expected_prompt=None, platform='cisco', command=None):
+            if command == 'show ssh':
+                raise TimeoutError('stub timeout text')
+            return outputs.get(command, 'switch#')
+        with patch.object(core, 'paramiko', FakeParamiko), patch.object(core, '_read_until_prompt', side_effect=read):
+            result = core.collect({'ip': '192.0.2.1', 'port': 22, 'username': 'u', 'password': 'test-ssh-password'}, {}, lambda: False, lambda _: None)
+        self.assertEqual(client.channel.sent, [command + '\n' for command in core.COMMANDS])
+        self.assertEqual(result['status'], 'partial')
+        self.assertIn('aaa new-model', repr(result['facts']))
+        issue = next(item for item in result['issues'] if item['command'] == 'show ssh')
+        self.assertIn('optional session check', issue['message'])
+        self.assertNotIn('stub timeout text', repr(result))
+
     def test_command_error_detection_ignores_banner_text(self):
         from cisco_audit.core import _command_failed
         banner = ('show running-config\nBuilding configuration...\n'
@@ -645,12 +697,14 @@ restconf
  no login
  transport input ssh
 logging host 192.0.2.20 transport tcp port 514 vrf Mgmt
-logging buffered 16384
+logging buffered 16384 warnings
 logging console warnings
 ntp server vrf Mgmt 192.0.2.30 key 1 prefer
 ntp authentication-key 1 sha2 7 NTP_SECRET_DO_NOT_EXPORT
 clock timezone UTC 0 0
 service password-encryption
+no ip domain lookup
+enable algorithm-type scrypt secret 9 ENABLE_ALGO_SECRET
 ip ssh time-out 60
 ip ssh authentication-retries 3
 radius-server host 192.0.2.40 auth-port 1812 acct-port 1813 key RADIUS_SECRET_DO_NOT_EXPORT
@@ -662,12 +716,14 @@ interface GigabitEthernet1/0/1
         facts, _ = extract_config(config)
         for value in ('line vty 0 4 / no login',
                       'logging host 192.0.2.20',
-                      'logging buffered 16384',
+                      'logging buffered 16384 warnings',
                       'logging console warnings',
                       'ntp server 192.0.2.30',
                       'ntp authentication-key configured [key hidden]',
                       'clock timezone UTC 0 0',
                       'service password-encryption',
+                      'no ip domain lookup',
+                      'enable secret configured [value hidden]',
                       'ip ssh time-out 60',
                       'ip ssh authentication-retries 3',
                       'radius-server host 192.0.2.40',
@@ -676,6 +732,7 @@ interface GigabitEthernet1/0/1
                       'interface GigabitEthernet1/0/1 / ip vrf forwarding MGMT'):
             self.assertIn(value, facts)
         self.assertNotIn('NTP_SECRET_DO_NOT_EXPORT', repr(facts))
+        self.assertNotIn('ENABLE_ALGO_SECRET', repr(facts))
         self.assertNotIn('RADIUS_SECRET_DO_NOT_EXPORT', repr(facts))
         self.assertNotIn('TACACS_SECRET_DO_NOT_EXPORT', repr(facts))
 

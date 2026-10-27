@@ -44,7 +44,7 @@ CHECKLIST = {
              ('show running-config', 'show privilege'),
              'Reconcile local and TACACS+/RADIUS administrators with approved owners and effective server-assigned command privileges.', accounts=True),
         Item('CS-02', 'AAA login and sessions', ('aaa authentication ', 'line vty ', 'line con ', 'login ', 'aaa new-model'),
-             ('show running-config', 'show users'),
+             ('show running-config',),
              'Review every VTY/console method list, fallback, timeout and failed-login control; verify actual login and MFA evidence without changing AAA.'),
         Item('CS-03', 'Management access sources', ('line vty ', 'access-list ', 'ip access-list ', 'ipv6 access-list ', 'interface ', 'vrf '),
              ('show running-config', 'show ip ssh'),

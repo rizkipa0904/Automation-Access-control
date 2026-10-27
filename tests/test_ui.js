@@ -42,6 +42,7 @@ const fetch=async (url,opts={})=>{
   else if(url==='/projects') result={projects,storage_error:null};
   else if(url==='/runs' && opts.method==='POST') { const body=JSON.parse(opts.body), id=`r${++runSequence}`; const info={id,project_id:body.project_id,platform:body.platform,started:'2026-01-01',total:body.targets.length,done:false}; projects.find(p=>p.id===body.project_id).runs.push(info); runs[id]={...info,project_name:projects.find(p=>p.id===body.project_id).name,results:[{ip:body.targets[0].ip,port:22,status:'collecting',current_command:'show version',activity:[{type:'command',command:'show version',time:'2026-01-01T12:00:00Z'},{type:'output',command:'show version',text:'filtered output',time:'2026-01-01T12:00:01Z'}],evidence:[{command:'show version',text:'<script>test</script>'}],issues:[]}]}; result={id}; }
   else if(url.startsWith('/runs/') && opts.method==='DELETE') { const id=url.split('/')[2]; const run=runs[id]; projects.find(p=>p.id===run.project_id).runs=projects.find(p=>p.id===run.project_id).runs.filter(x=>x.id!==id); delete runs[id]; result={ok:true}; }
+  else if(url==='/approve-key' && opts.method==='POST') result={ok:true};
   else if(url.startsWith('/runs/')) result=runs[url.split('/')[2]];
   else throw Error('Unexpected request '+url);
   return {ok:true,json:async()=>result};
@@ -209,6 +210,16 @@ const settle=()=>new Promise(resolve=>setImmediate(resolve));
   const afterSecondRevisionPoll = requests.filter(x=>x.url==='/runs/r4').length;
   assert.equal(afterFirstRevisionPoll, beforeRevisionPolls + 1);
   assert.equal(afterSecondRevisionPoll, afterFirstRevisionPoll);
+  // Host-key approval uses the exact displayed fingerprint and disables the button.
+  runs.r4.revision = 8; projects[2].runs[0].revision = 8;
+  runs.r4.results[0].host_key = {type:'ssh-ed25519', fingerprint:'SHA256:test-fingerprint'};
+  runs.r4.results[0].status = 'host_key_unknown';
+  await vm.runInContext('refresh()',ctx);
+  const approve = elements.results.querySelector('[data-focus-key=approve]');
+  assert(approve && approve.disabled === false);
+  await approve.onclick();
+  assert.equal(approve.disabled, true);
+  assert(requests.some(x=>x.url==='/approve-key' && JSON.parse(x.opts.body).fingerprint==='SHA256:test-fingerprint'));
   assert(requests.every(x=>x.opts.headers['X-Session-Token']==='token'));
   console.log('UI simulation passed: projects, reruns, scan deletion, status totals, scroll preservation, and sanitized preview.');
 })().catch(err=>{console.error(err);process.exitCode=1;});

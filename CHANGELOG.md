@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.1.1 — 2026-10-27
+
+### Fixed
+
+- Cisco `show running-config` now runs immediately after `show version`,
+  before inventory, privilege, SSH status, and the optional `show ssh` check.
+  Configuration and AAA evidence can no longer be blocked by a slow later
+  command.
+- `show users` is intentionally excluded from collection. Some IOS releases
+  perform a reverse DNS lookup for it and can pause for about a minute when DNS
+  is unreachable; its session output was never exported, so no report evidence
+  is lost. The reason is documented in the README.
+- Command timeouts are tuned per command: normal show commands 30 seconds,
+  `show running-config` / `show config running` 60 seconds, and optional
+  `show ssh` 10 seconds. A `show ssh` timeout reports that the optional check
+  was skipped and earlier evidence is retained. The tool never sends a recovery
+  key or configuration command.
+- `ip domain lookup` / `no ip domain lookup` is extracted as a diagnostic
+  configuration fact.
+- Cisco account extraction now only accepts top-level `username` lines, so the
+  `username` entry inside `ip ssh pubkey-chain` is not misreported as a local
+  account.
+- Cisco `show running-config` banner blocks are skipped until the closing
+  delimiter, so banner text cannot inject fake `username` or `enable` facts.
+- Cisco extraction adds `enable algorithm-type ... secret`, `enable secret
+  level ...`, `logging buffered ... <severity>`, and
+  `login on-failure/success log ... every ...`.
+- PAN `show admins all` ignores table separators and `Total:`/summary lines and
+  rejects punctuation-only names instead of reporting them as administrators.
+- PAN `show config running` in `set` output now produces a specific issue
+  explaining that XML output is required.
+- The SSH pseudo-terminal is widened to 512 columns to reduce wrapping of
+  running-config and PAN-OS XML lines.
+- Added an end-to-end fixture matrix covering all 12 access-control checklist
+  items, secret leakage, malformed input, banner handling, empty scans, and
+  missing optional result fields, plus a UI host-key approval test.
+
+### Verification
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v   # 83 tests
+node tests/test_ui.js
+```
+
+See `VALIDATION.md` for the control/evidence traceability matrix and residual
+lab-validation requirements.
+
 ## 1.1.0 — 2026-10-27
 
 Production-hardening release for the local Cisco IOS / IOS XE and Palo Alto

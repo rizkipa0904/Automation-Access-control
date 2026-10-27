@@ -30,6 +30,27 @@ WHITE = 'FFFFFF'
 TEXT = '233447'
 MUTED = '617386'
 
+# Shared style objects keep workbook generation fast and memory-bounded for
+# large scans. openpyxl copies style references when assigning them to cells.
+BODY_FONT = Font(name='Aptos', size=10, color=TEXT)
+BODY_BOLD_FONT = Font(name='Aptos', size=10, color=TEXT, bold=True)
+BODY_ALIGNMENT = Alignment(wrap_text=True, vertical='top', indent=1)
+ZEBRA_FILL = PatternFill('solid', fgColor='F7FAFB')
+HAIR_BORDER = Border(bottom=Side(style='hair', color='D9E5E9'))
+LINK_FONT = Font(name='Aptos', size=10, color=TEAL, underline='single')
+BAND_FONT = Font(name='Aptos', color=WHITE, bold=True, size=12)
+BAND_ALIGNMENT = Alignment(vertical='center', indent=1)
+BAND_FILLS = {
+    'completed': PatternFill('solid', fgColor=TEAL),
+    'other': PatternFill('solid', fgColor=NAVY_LIGHT),
+}
+STATUS_FILLS = {
+    'green': PatternFill('solid', fgColor='DDF1EA'),
+    'amber': PatternFill('solid', fgColor='FCE8D1'),
+    'grey': PatternFill('solid', fgColor='E9EEF3'),
+    'blue': PatternFill('solid', fgColor='E2E9FF'),
+}
+
 
 def _excel_value(value):
     """Escape formula prefixes and characters forbidden in Excel XML."""
@@ -132,7 +153,6 @@ def workbook(run):
 
     evidence_rows = {}
     evidence_references = []
-    bottom_line = Border(bottom=Side(style='hair', color='D9E5E9'))
     for number, result in enumerate(results, 1):
         did = f'D{number:04d}'
         ip = str(result.get('ip', ''))
@@ -150,9 +170,9 @@ def workbook(run):
         ws.merge_cells(start_row=band, start_column=1, end_row=band, end_column=LAST_COLUMN)
         title = f'{number:02d}  /  {endpoint}    ·    {hostname or "Hostname unavailable"}    ·    {device_platform.upper()}    ·    {status.upper()}'
         cell = ws.cell(band, 1, _excel_value(title))
-        cell.fill = PatternFill('solid', fgColor=TEAL if status == 'completed' else NAVY_LIGHT)
-        cell.font = Font(name='Aptos', color=WHITE, bold=True, size=12)
-        cell.alignment = Alignment(vertical='center', indent=1)
+        cell.fill = BAND_FILLS['completed' if status == 'completed' else 'other']
+        cell.font = BAND_FONT
+        cell.alignment = BAND_ALIGNMENT
         ws.row_dimensions[band].height = 32
 
         def add_row(section, check, value, state='', eid='', command='', note='', collected=timestamp):
@@ -160,19 +180,19 @@ def workbook(run):
             ws.row_dimensions[row].height = 43 if section == 'Evidence' else 33
             for col in range(1, LAST_COLUMN + 1):
                 c = ws.cell(row, col)
-                c.font = Font(name='Aptos', size=10, color=TEXT, bold=(col == 2))
-                c.alignment = Alignment(wrap_text=True, vertical='top', indent=1)
-                c.border = bottom_line
+                c.font = BODY_BOLD_FONT if col == 2 else BODY_FONT
+                c.alignment = BODY_ALIGNMENT
+                c.border = HAIR_BORDER
                 if row % 2 == 0:
-                    c.fill = PatternFill('solid', fgColor='F7FAFB')
+                    c.fill = ZEBRA_FILL
             if state in ('Observed', 'completed'):
-                ws.cell(row, 5).fill = PatternFill('solid', fgColor='DDF1EA')
+                ws.cell(row, 5).fill = STATUS_FILLS['green']
             elif state in ('Attention', 'partial', 'failed', 'host_key_unknown', 'interrupted'):
-                ws.cell(row, 5).fill = PatternFill('solid', fgColor='FCE8D1')
+                ws.cell(row, 5).fill = STATUS_FILLS['amber']
             elif state in ('Not Available', 'Not collected', 'Manual verification', 'queued', 'connecting', 'collecting', 'cancelled'):
-                ws.cell(row, 5).fill = PatternFill('solid', fgColor='E9EEF3')
+                ws.cell(row, 5).fill = STATUS_FILLS['grey']
             elif state == 'Needs review':
-                ws.cell(row, 5).fill = PatternFill('solid', fgColor='E2E9FF')
+                ws.cell(row, 5).fill = STATUS_FILLS['blue']
             if eid and section != 'Evidence':
                 evidence_references.append((ws.cell(row, 6), eid))
             return row
@@ -286,7 +306,7 @@ def workbook(run):
         row = evidence_rows.get(eid)
         if row:
             cell.hyperlink = Hyperlink(ref=cell.coordinate, location=f"'Audit Results'!A{row}", display=eid)
-            cell.font = Font(name='Aptos', size=10, color=TEAL, underline='single')
+            cell.font = LINK_FONT
     ws.print_area = f'A1:{get_column_letter(LAST_COLUMN)}{ws.max_row}'
     decision = DataValidation(type='list', formula1='"Pass,Fail,Needs review,Not available"', allow_blank=True)
     decision.errorTitle = 'Invalid decision'
