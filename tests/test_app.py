@@ -22,7 +22,7 @@ HAS_REPORT = importlib.util.find_spec('openpyxl') is not None
 if HAS_REPORT:
     import app
 
-@unittest.skipUnless(HAS_REPORT, 'openpyxl belum terpasang')
+@unittest.skipUnless(HAS_REPORT, 'openpyxl is not installed')
 class PlatformTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -31,12 +31,14 @@ class PlatformTests(unittest.TestCase):
         app.RUNS.clear(); app.PROJECTS.clear()
     def tearDown(self):
         self.patches.stop(); self.tmp.cleanup()
-    def request(self, body=None, token=True, path='/runs', method='POST'):
+    def request(self, body=None, token=True, path='/runs', method='POST', host='127.0.0.1:8912', origin=None):
         payload = json.dumps(body or {}).encode()
         handler = app.Handler.__new__(app.Handler)
         handler.server = SimpleNamespace(server_port=8912)
         handler.path = path
-        handler.headers = {'Content-Type': 'application/json', 'Content-Length': str(len(payload)), 'Host': '127.0.0.1:8912'}
+        handler.headers = {'Content-Type': 'application/json', 'Content-Length': str(len(payload)), 'Host': host}
+        if origin:
+            handler.headers['Origin'] = origin
         if token:
             handler.headers['X-Session-Token'] = app.TOKEN
         handler.rfile = BytesIO(payload)
@@ -53,6 +55,12 @@ class PlatformTests(unittest.TestCase):
             if app.RUNS[rid]['done']: return
             time.sleep(.01)
         self.fail('worker did not finish')
+    def test_host_and_origin_are_restricted_to_loopback(self):
+        self.assertEqual(self.request({'name': 'Local'}, path='/projects', host='localhost:8912')[0], 200)
+        self.assertEqual(self.request({'name': 'Wrong host'}, path='/projects', host='127.0.0.1:9999')[0], 403)
+        self.assertEqual(self.request({'name': 'Wrong origin'}, path='/projects', origin='http://evil.example')[0], 403)
+        self.assertEqual(self.request({'name': 'Local origin'}, path='/projects', origin='http://localhost:8912')[0], 200)
+
     def test_rejects_missing_invalid_and_incompatible_platforms(self):
         project_id = self.project('Example')
         row = {'ip': '192.0.2.1', 'username': 'u', 'password': 'p'}
@@ -122,6 +130,41 @@ class PlatformTests(unittest.TestCase):
             final_status, final_run = self.request(payload)
             self.assertEqual(final_status, 200)
             self.await_done(final_run['id'])
+
+    def test_run_revision_tracks_live_updates(self):
+        project = self.project('Revision')
+        def fake_collect(target, approved, cancelled, update, **kwargs):
+            update('collecting')
+            kwargs['on_event']({'type': 'command_started', 'command': 'show version'})
+            return {'ip': target['ip'], 'port': target['port'], 'status': 'completed', 'issues': [], 'evidence': [], 'accounts': [], 'facts': []}
+        with patch.object(app, 'collect', side_effect=fake_collect):
+            status, run = self.request({'project_id': project, 'platform': 'cisco', 'targets': [{'ip': '192.0.2.1', 'username': 'u', 'password': 'p'}]})
+            self.assertEqual(status, 200)
+            self.await_done(run['id'])
+        stored = app.RUNS[run['id']]
+        self.assertGreaterEqual(stored['revision'], 3)
+        code, detail = self.request(path='/projects/' + project, method='GET')
+        self.assertEqual(code, 200)
+        self.assertEqual(detail['runs'][0]['revision'], stored['revision'])
+
+    def test_report_generation_failure_returns_safe_500(self):
+        project = self.project('Report')
+        def fake_collect(target, approved, cancelled, update, **kwargs):
+            return {'ip': target['ip'], 'port': target['port'], 'status': 'completed', 'issues': [], 'evidence': [], 'accounts': [], 'facts': []}
+        with patch.object(app, 'collect', side_effect=fake_collect):
+            status, run = self.request({'project_id': project, 'platform': 'cisco', 'targets': [{'ip': '192.0.2.1', 'username': 'u', 'password': 'p'}]})
+            self.assertEqual(status, 200)
+            self.await_done(run['id'])
+        with patch.object(app, 'workbook', side_effect=RuntimeError('raw secret detail')):
+            code, data = self.request(path=f"/runs/{run['id']}/xlsx", method='GET')
+        self.assertEqual(code, 500)
+        self.assertEqual(data, {'error': 'The report could not be generated.'})
+
+    def test_unexpected_post_failure_returns_safe_500(self):
+        with patch.object(app, 'save_state', side_effect=RuntimeError('raw secret detail')):
+            code, data = self.request({'name': 'Broken'}, path='/projects')
+        self.assertEqual(code, 500)
+        self.assertEqual(data, {'error': 'The request could not be completed.'})
 
     def test_completed_device_clears_current_command(self):
         project = self.project('Status')

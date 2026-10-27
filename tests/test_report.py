@@ -120,6 +120,21 @@ class WorkbookTests(unittest.TestCase):
         self.assertIn('Truncated', evidence[7])
         self.assertIn('truncated', self.check(ws, 'SSH status')[7])
 
+    def test_report_has_auditor_columns_version_and_status_legend(self):
+        from cisco_audit import __version__
+        result = {'ip': '192.0.2.50', 'port': 22, 'status': 'completed',
+                  'evidence': [], 'accounts': [], 'facts': [], 'issues': []}
+        ws = self.load('cisco', result)
+        headers = [ws.cell(11, column).value for column in range(1, 14)]
+        self.assertEqual(headers[-4:], ['Auditor decision', 'Owner', 'Reviewer comment', 'Review date'])
+        self.assertEqual(ws['A10'].value, 'Tool version')
+        self.assertEqual(ws['B10'].value, __version__)
+        self.assertEqual(ws['E10'].value, 'Report generated (UTC)')
+        self.assertIn('Status legend', ws['A9'].value)
+        decisions = ws.data_validations.dataValidation
+        self.assertTrue(decisions)
+        self.assertTrue(any('J12' in str(rule.sqref) for rule in decisions))
+
     def test_interrupted_scan_does_not_fabricate_timestamp(self):
         result = {'ip': '192.0.2.8', 'port': 22, 'status': 'interrupted',
                   'evidence': [{'command': 'show ip ssh', 'text': 'SSH Enabled - version 2.0', 'status': 'filtered'}],

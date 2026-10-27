@@ -4,9 +4,9 @@ __pycache__/
 *.xlsx
 *.csv
 .pytest_cache/
+.DS_Store
 
 data/
-.access-review-data/
 .access-review-data/
 
 !examples/devices-sample.csv

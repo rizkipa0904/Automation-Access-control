@@ -18,11 +18,19 @@ class LauncherTests(unittest.TestCase):
             def create(path, with_pip):
                 python.parent.mkdir(parents=True)
                 python.touch()
-            with patch.multiple(start, ROOT=root, ENV=env, PYTHON=python, REQUIREMENTS=req, MARKER=marker), patch.object(start.sys, 'platform', 'darwin'), patch.object(start.venv, 'create', side_effect=create), patch.object(start.os, 'chdir'), patch.object(start.os, 'execv') as execute, patch.object(start.subprocess, 'run', side_effect=[SimpleNamespace(returncode=1), SimpleNamespace(returncode=0)]) as run:
+            with patch.multiple(start, ROOT=root, ENV=env, PYTHON=python, REQUIREMENTS=req, MARKER=marker), patch.object(start.sys, 'platform', 'darwin'), patch.object(start.venv, 'create', side_effect=create), patch.object(start.os, 'chdir'), patch.object(start.os, 'execv') as execute, patch.object(start.subprocess, 'run', side_effect=[SimpleNamespace(returncode=1), SimpleNamespace(returncode=0), SimpleNamespace(returncode=0)]) as run:
                 self.assertEqual(start.main(), 0)
-                self.assertEqual(run.call_count, 2)
+                self.assertEqual(run.call_count, 3)
                 execute.assert_called_once()
                 self.assertEqual(marker.read_bytes(), req.read_bytes())
+
+    def test_import_failure_after_install_does_not_start_app(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); env = root / '.venv'; env.mkdir(); python = env / 'python'; python.touch(); req = root / 'requirements.txt'; req.write_text('example\n'); marker = env / 'marker'
+            with patch.multiple(start, ROOT=root, ENV=env, PYTHON=python, REQUIREMENTS=req, MARKER=marker), patch.object(start.sys, 'platform', 'darwin'), patch.object(start.os, 'chdir'), patch.object(start.os, 'execv') as execute, patch.object(start.subprocess, 'run', side_effect=[SimpleNamespace(returncode=1), SimpleNamespace(returncode=0), SimpleNamespace(returncode=1)]):
+                self.assertEqual(start.main(), 1)
+                execute.assert_not_called()
+                self.assertFalse(marker.exists())
 
     def test_install_failure_does_not_start_app(self):
         with tempfile.TemporaryDirectory() as tmp:

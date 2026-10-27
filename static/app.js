@@ -2,15 +2,26 @@
 const $ = id => document.getElementById(id);
 const token = document.querySelector('meta[name="session-token"]').content;
 let projectId = null, runId = null, polling = false, csvGeneration = 0, currentRun = null, selectedDeviceIndex = 0;
-let rerunSourceId = null, lastProjectsSignature = '', lastRunSignature = '';
+let rerunSourceId = null, lastProjectsSignature = '', lastRunSignature = '', lastRunRevision = null;
 const openDevices = new Set(), approvedKeys = new Set(), openChecklistItems = new Set();
 const setupStorageKey = 'network-access-review-project-setup-v1';
 let projectSetup = {};
 try { projectSetup = JSON.parse(localStorage.getItem(setupStorageKey) || '{}') || {}; } catch (_) { projectSetup = {}; }
 async function api(path, options = {}) {
-  options.headers = {...options.headers, 'X-Session-Token': token};
-  const response = await fetch(path, options);
-  if (!response.ok) { let e = await response.json(); throw new Error(e.error || 'Request failed'); }
+  const {timeoutMs = 20000, ...fetchOptions} = options;
+  fetchOptions.headers = {...fetchOptions.headers, 'X-Session-Token': token};
+  const signal = (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) ? AbortSignal.timeout(timeoutMs) : undefined;
+  let response;
+  try { response = await fetch(path, {...fetchOptions, signal}); }
+  catch (e) {
+    if (e?.name === 'TimeoutError' || e?.name === 'AbortError') throw new Error('The local app did not respond in time.');
+    throw e;
+  }
+  if (!response.ok) {
+    let message = 'Request failed';
+    try { const e = await response.json(); message = e.error || message; } catch (_) {}
+    throw new Error(message);
+  }
   return response;
 }
 function post(path, data) { return api(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)}); }
@@ -198,7 +209,7 @@ $('cancel').onclick = async () => {
 $('download').onclick = async () => {
   if (!runId) return;
   const selectedRun = runId;
-  try { const r = await api(`/runs/${selectedRun}/xlsx`); saveBlob(await r.blob(), `Access_Review_${selectedRun.slice(0,8)}.xlsx`); }
+  try { const r = await api(`/runs/${selectedRun}/xlsx`, {timeoutMs:180000}); saveBlob(await r.blob(), `Access_Review_${selectedRun.slice(0,8)}.xlsx`); }
   catch (e) { $('error').textContent = e.message; }
 };
 $('rerun').onclick = () => prepareRerun(currentRun);
@@ -246,7 +257,7 @@ function renderProjects(projects) {
   if (focusedProject) list.querySelector?.(`.project-item[data-project-id="${focusedProject}"]`)?.focus?.({preventScroll:true});
   if (focusedScan) scans.querySelector?.(`.scan-item[data-run-id="${focusedScan}"]`)?.focus?.({preventScroll:true});
 }
-function timeLabel(value) { return value && value.length >= 19 ? value.slice(11,19) : '--:--:--'; }
+function timeLabel(value) { return value && value.length >= 19 ? value.slice(11,19)+'Z' : '--:--:--'; }
 function renderAccessChecks(run, device) {
   const section=node('section','access-checks');
   section.append(node('div','preview-heading','ACCESS CONTROL REVIEW'));
@@ -259,13 +270,13 @@ function renderAccessChecks(run, device) {
   if(run.platform==='cisco') {
     const users=accounts.map(a=>`${a.username} · privilege ${a.privilege||'unspecified'}`).join('\n');
     add('Local configured accounts',users||'No local account entries could be extracted.',users?'Observed':'Not available');
-    const aaa=facts.filter(f=>/^(aaa |radius server |tacacs server )/i.test(f)).join('\n');
+    const aaa=facts.filter(f=>/^(aaa |radius server |tacacs server |radius-server |tacacs-server )/i.test(f)).join('\n');
     add('AAA, RADIUS, and TACACS+',aaa||'No approved AAA or external server fields were extracted.',aaa?'Observed':'Not available');
     const vty=facts.filter(f=>/^line vty /i.test(f)).join('\n');
     add('VTY access controls',vty||'No approved VTY access fields were extracted.',vty?'Observed':'Not available');
     const ssh=(device.evidence||[]).find(e=>e.command==='show ip ssh');
     add('SSH service',ssh?.text||'SSH state was not available from the collected output.',ssh&&!ssh.text.startsWith('[')?'Observed':'Not available');
-    const ext=facts.filter(f=>/^(aaa (authentication|authorization|accounting)|aaa group server|radius server|tacacs server)/i.test(f));
+    const ext=facts.filter(f=>/^(aaa (authentication|authorization|accounting)|aaa group server|radius server|tacacs server|radius-server|tacacs-server)/i.test(f));
     add('MFA enforcement',ext.length?`External AAA references were observed (${ext.length}). The RADIUS/TACACS+ provider policy and any second-factor challenge were not checked.`:'No external RADIUS/TACACS+ reference was extracted. MFA state cannot be determined from this device snapshot.','Not verified');
   } else if (run.platform==='paloalto') {
     const admins=accounts.map(a=>`${a.username} · ${a.privilege||'role unknown'}${a.source==='show admins all'?' · known to device':''}`).join('\n');
@@ -391,6 +402,7 @@ function renderRun(run) {
 function clearRun() {
   currentRun = null;
   lastRunSignature = '';
+  lastRunRevision = null;
   $('summary').textContent = 'Select a project and scan to view device activity.';
   $('results').replaceChildren(); $('status-cards').replaceChildren(); $('download').disabled = true; $('rerun').disabled = true; $('cancel').disabled = true; $('delete-run').disabled = true;
 }
@@ -422,11 +434,18 @@ async function refresh() {
     if (projectsSignature!==lastProjectsSignature) { renderProjects(projects); lastProjectsSignature=projectsSignature; }
     const selectedRunId = runId;
     if (selectedRunId) {
-      const run = await (await api(`/runs/${selectedRunId}`)).json();
-      if (runId === selectedRunId && projectId === run.project_id && JSON.stringify(run)!==lastRunSignature) renderRun(run);
+      const summary = selectedProject?.runs.find(item => item.id === selectedRunId);
+      const revision = summary?.revision;
+      const unchanged = currentRun?.id === selectedRunId && Number.isInteger(revision) && revision === lastRunRevision;
+      if (!unchanged) {
+        const run = await (await api(`/runs/${selectedRunId}`)).json();
+        if (runId === selectedRunId && projectId === run.project_id && JSON.stringify(run)!==lastRunSignature) renderRun(run);
+        lastRunRevision = Number.isInteger(revision) ? revision : null;
+      }
     } else { clearRun(); const project=projects.find(p=>p.id===projectId); $('selected-project').textContent=project?project.name:'Select a project'; $('summary').textContent=project?'No scan yet. Create a new scan to start reviewing devices.':'Choose a project to view its access review status.'; }
-  } catch (e) { $('error').textContent = e.message; }
+    $('poll-error').textContent = '';
+  } catch (e) { $('poll-error').textContent = e.message; }
   finally { polling = false; }
 }
-setInterval(refresh, 650);
+setInterval(refresh, 1000);
 refresh();

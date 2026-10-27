@@ -18,6 +18,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from cisco_audit import __version__
 from cisco_audit.core import collect, validate_target
 from cisco_audit.checklist import evaluate
 from cisco_audit.report import workbook
@@ -178,11 +179,17 @@ def load_state():
                 raise ValueError('Invalid state path')
             state = json.loads(STATE_FILE.read_text(encoding='utf-8'))
             validate_state(state)
+            try:
+                os.chmod(STATE_FILE, 0o600)
+            except OSError:
+                pass
             projects = {}
             runs = {}
             for project in state['projects']:
                 projects[project['id']] = {**project, 'approved': {}, 'pending': {}}
             for run in state['runs']:
+                if type(run.get('revision')) is not int or run['revision'] < 0:
+                    run['revision'] = 0
                 run['cancel'] = threading.Event()
                 for result in run['results']:
                     result.setdefault('activity', [])
@@ -196,6 +203,7 @@ def load_state():
                             result['status'] = 'interrupted'
                             result['current_command'] = ''
                             result.setdefault('issues', []).append({'command': '', 'message': 'The app stopped before the scan finished.'})
+                    run['revision'] += 1
                 runs[run['id']] = run
             PROJECTS.clear()
             PROJECTS.update(projects)
@@ -215,6 +223,7 @@ def worker(run, targets):
         def update(status):
             with LOCK:
                 run['results'][index]['status'] = status
+                run['revision'] = run.get('revision', 0) + 1
                 save_state(force=False)
 
         def on_event(event):
@@ -243,6 +252,7 @@ def worker(run, targets):
                     item = {key: event.get(key, '') for key in ('type', 'message', 'command')}
                     item['time'] = now()
                     result.setdefault('activity', []).append(item)
+                run['revision'] = run.get('revision', 0) + 1
                 if len(result.get('activity', [])) > 300:
                     result['activity'] = result['activity'][-300:]
                 save_state(force=False)
@@ -281,6 +291,7 @@ def worker(run, targets):
                 endpoint = result['ip'] if result['port'] == 22 else f"[{result['ip']}]:{result['port']}"
                 PROJECTS[run['project_id']]['pending'][endpoint] = key
             run['results'][index] = result
+            run['revision'] = run.get('revision', 0) + 1
             remaining[0] -= 1
             if remaining[0] == 0:
                 run['finished'] = now()
@@ -307,13 +318,16 @@ def run_summary(run):
     return {'id': run['id'], 'project_id': run['project_id'], 'platform': run['platform'],
             'started': run['started'], 'done': run['done'], 'total': len(run['results']),
             'counts': dict(Counter(r['status'] for r in run['results'])),
-            'rerun_of': run.get('rerun_of')}
+            'revision': run.get('revision', 0), 'rerun_of': run.get('rerun_of')}
 
 def project_summary(project):
     return {'id': project['id'], 'name': project['name'], 'created': project['created'],
             'runs': [run_summary(RUNS[rid]) for rid in project['runs']]}
 
 class Handler(BaseHTTPRequestHandler):
+    server_version = 'NetworkAccessReview'
+    sys_version = ''
+
     def log_message(self, *_):
         pass
     def headers_common(self, status, typ):
@@ -321,20 +335,27 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Content-Type', typ)
         self.send_header('Cache-Control', 'no-store')
         self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
         self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'")
         self.send_header('Referrer-Policy', 'no-referrer')
+        self.send_header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
     def respond(self, obj, status=200):
         data = json.dumps(obj, ensure_ascii=False).encode()
         self.headers_common(status, 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
     def valid(self, api=False):
+        port = self.server.server_port
+        allowed = (f'127.0.0.1:{port}', f'localhost:{port}')
         host = self.headers.get('Host', '')
-        if host != f'127.0.0.1:{self.server.server_port}':
+        if host not in allowed:
             return False
         origin = self.headers.get('Origin')
-        if origin and origin != f'http://127.0.0.1:{self.server.server_port}':
+        if origin and origin not in tuple('http://' + item for item in allowed):
             return False
         if api and not secrets.compare_digest(self.headers.get('X-Session-Token', ''), TOKEN):
             return False
@@ -345,13 +366,19 @@ class Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path in ('/', '/style.css', '/app.js'):
             file = {'/': 'index.html', '/style.css': 'style.css', '/app.js': 'app.js'}[path]
-            data = (ROOT / 'static' / file).read_bytes()
+            try:
+                data = (ROOT / 'static' / file).read_bytes()
+            except OSError:
+                return self.respond({'error': 'Static resource not found.'}, 404)
             if path == '/':
-                data = data.replace(b'__SESSION_TOKEN__', TOKEN.encode())
+                data = data.replace(b'__SESSION_TOKEN__', TOKEN.encode()).replace(b'__APP_VERSION__', __version__.encode())
             self.headers_common(200, {'/': 'text/html; charset=utf-8', '/style.css': 'text/css; charset=utf-8', '/app.js': 'application/javascript; charset=utf-8'}[path])
             self.send_header('Content-Length', str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
             return
         if not self.valid(True):
             return self.respond({'error': 'Forbidden'}, 403)
@@ -368,20 +395,30 @@ class Handler(BaseHTTPRequestHandler):
                 snapshot = project_summary(project)
             return self.respond(snapshot)
         if len(parts) >= 2 and parts[0] == 'runs':
-            with LOCK:
-                run = RUNS.get(parts[1])
-                if not run:
-                    return self.respond({'error': 'Scan not found'}, 404)
-                snapshot = json.loads(json.dumps(public(run)))
-            for index, result in enumerate(snapshot['results'], 1):
-                result['checklist'] = evaluate(result, snapshot['platform'], f'D{index:04d}')
+            try:
+                with LOCK:
+                    run = RUNS.get(parts[1])
+                    if not run:
+                        return self.respond({'error': 'Scan not found'}, 404)
+                    snapshot = json.loads(json.dumps(public(run)))
+                for index, result in enumerate(snapshot['results'], 1):
+                    result['checklist'] = evaluate(result, snapshot['platform'], f'D{index:04d}')
+            except Exception:
+                return self.respond({'error': 'The scan data could not be read.'}, 500)
             if len(parts) == 3 and parts[2] == 'xlsx':
-                data = workbook(snapshot)
+                try:
+                    data = workbook(snapshot)
+                except Exception:
+                    return self.respond({'error': 'The report could not be generated.'}, 500)
                 self.headers_common(200, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
                 self.send_header('Content-Disposition', f'attachment; filename="Access_Review_{parts[1][:8]}.xlsx"')
                 self.send_header('Content-Length', str(len(data)))
                 self.end_headers()
-                return self.wfile.write(data)
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
             return self.respond(snapshot)
         self.respond({'error': 'Not found'}, 404)
     def do_POST(self):
@@ -435,7 +472,7 @@ class Handler(BaseHTTPRequestHandler):
                         target = validate_target(row)
                         endpoint = (target['ip'], target['port'])
                         if endpoint in seen:
-                            raise ValueError('Endpoint duplikat')
+                            raise ValueError('Duplicate endpoint')
                         seen.add(endpoint)
                         targets.append(target)
                     except (ValueError, TypeError, AttributeError):
@@ -451,7 +488,7 @@ class Handler(BaseHTTPRequestHandler):
                         if source is None or source['project_id'] != project_id or not source['done']:
                             raise ValueError('The original scan is unavailable for rerun.')
                     rid = uuid.uuid4().hex
-                    run = {'id': rid, 'project_id': project_id, 'project_name': project['name'], 'started': now(), 'platform': platform, 'legacy': legacy, 'rerun_of': rerun_of, 'done': False, 'cancel': threading.Event(), 'results': [{'ip': t['ip'], 'port': t['port'], 'status': 'queued', 'issues': [], 'evidence': [], 'activity': [], 'accounts': [], 'facts': []} for t in targets]}
+                    run = {'id': rid, 'project_id': project_id, 'project_name': project['name'], 'started': now(), 'platform': platform, 'legacy': legacy, 'rerun_of': rerun_of, 'done': False, 'revision': 0, 'cancel': threading.Event(), 'results': [{'ip': t['ip'], 'port': t['port'], 'status': 'queued', 'issues': [], 'evidence': [], 'activity': [], 'accounts': [], 'facts': []} for t in targets]}
                     RUNS[rid] = run
                     project['runs'].append(rid)
                     if not save_state():
@@ -467,7 +504,9 @@ class Handler(BaseHTTPRequestHandler):
                     run = RUNS.get(run_id) if isinstance(run_id, str) else None
                     if not run:
                         raise ValueError('Scan not found.')
-                    project = PROJECTS[run['project_id']]
+                    project = PROJECTS.get(run['project_id'])
+                    if project is None:
+                        raise ValueError('Scan not found.')
                     key = project['pending'].get(endpoint) if isinstance(endpoint, str) else None
                     from cisco_audit.core import fingerprint
                     if not key or not isinstance(body.get('fingerprint'), str) or not secrets.compare_digest(fingerprint(key), body['fingerprint']):
@@ -490,6 +529,10 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError) as exc:
             message = str(exc) if isinstance(exc, ValueError) and (str(exc).startswith('Row ') or str(exc) in ('The target count must be between 1 and 200.', 'Select an available project.', 'Enter a project name (100 characters maximum).', 'The project limit has been reached.', 'A project with this name already exists.', 'Scan not found.', 'The host key is unavailable or its fingerprint does not match.', 'Invalid request size.', 'Select Cisco or Palo Alto as the platform.', 'Legacy SSH compatibility is available for Cisco only.', 'The original scan is unavailable for rerun.', 'This project has reached 100 saved scans. Download and delete an old completed scan before starting another.')) else 'Invalid input.'
             return self.respond({'error': message}, 400)
+        except Exception:
+            # Never let an unexpected handler failure expose internals or leave
+            # the browser without a response.
+            return self.respond({'error': 'The request could not be completed.'}, 500)
 
     def do_DELETE(self):
         if not self.valid(True):
@@ -503,7 +546,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self.respond({'error': 'Scan not found'}, 404)
             if not run['done']:
                 return self.respond({'error': 'Cancel the scan and wait for it to finish before deleting it.'}, 409)
-            project = PROJECTS[run['project_id']]
+            project = PROJECTS.get(run['project_id'])
+            if project is None or parts[1] not in project['runs']:
+                return self.respond({'error': 'Scan not found.'}, 404)
             run_index = project['runs'].index(parts[1])
             del RUNS[parts[1]]
             project['runs'].pop(run_index)
@@ -521,10 +566,17 @@ def main():
         return 1
     try:
         load_state()
-        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        try:
+            server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        except OSError as exc:
+            print(f'Could not start the local server: {exc}', file=sys.stderr)
+            return 1
         url = f'http://127.0.0.1:{server.server_port}/'
         print(f'Network Access Review: {url}\nPress Ctrl+C to stop.', flush=True)
-        webbrowser.open(url)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
         try:
             server.serve_forever()
         except KeyboardInterrupt:

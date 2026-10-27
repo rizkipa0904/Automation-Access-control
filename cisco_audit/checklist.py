@@ -26,13 +26,13 @@ CHECKLIST = {
         Item('PA-02', 'Authentication and sessions', ('authentication-profile ', 'password-complexity ', 'management idle-timeout ', 'management admin-lockout ', 'admin '),
              ('show config running',),
              'Verify Web UI and CLI login paths, default-password controls, MFA policy and challenge at the identity provider, failed-login behavior, and emergency accounts.'),
-        Item('PA-03', 'Management access sources', ('management permitted-ip ', 'interface-management ', 'management interface ', 'ipv6 '),
+        Item('PA-03', 'Management access sources', ('management permitted-ip ', 'interface-management ', 'interface ', 'management interface ', 'ipv6 '),
              ('show config running',),
              'Trace management-profile assignments, permitted IPv4/IPv6 sources, bastion paths, and external network controls; confirm no unapproved exposure.'),
         Item('PA-04', 'Services and API access', ('management service ', 'management api ', 'interface-management ', 'snmp ', 'api-key-lifetime ', 'tls '),
              ('show config running',),
              'Review HTTPS, SSH, SNMP and API on every management interface; verify API roles, key lifetime/revocation, TLS, and source restrictions.'),
-        Item('PA-05', 'Administrator activity logging', ('logging ', 'log-forwarding ', 'management time ', 'ntp '),
+        Item('PA-05', 'Administrator activity logging', ('system log forwarding ', 'config log forwarding ', 'log forwarding ', 'logging ', 'log-forwarding ', 'system timezone ', 'management time ', 'system ntp ', 'ntp '),
              ('show config running',),
              'Sample System and Config logs, match account/source/time to a change ticket, and verify forwarding, time, and retention in the log destination.'),
         Item('PA-06', 'Access lifecycle', ('admin ',), ('show admins all', 'show config running'),
@@ -40,10 +40,10 @@ CHECKLIST = {
              accounts=True, manual=True),
     ),
     'cisco': (
-        Item('CS-01', 'Administrator accounts and privileges', ('aaa authorization ', 'username ', 'enable secret ', 'aaa group server '),
+        Item('CS-01', 'Administrator accounts and privileges', ('aaa authorization ', 'username ', 'enable secret ', 'aaa group server ', 'radius server ', 'tacacs server ', 'radius-server ', 'tacacs-server '),
              ('show running-config', 'show privilege'),
              'Reconcile local and TACACS+/RADIUS administrators with approved owners and effective server-assigned command privileges.', accounts=True),
-        Item('CS-02', 'AAA login and sessions', ('aaa authentication ', 'line vty ', 'line con ', 'login block-', 'aaa new-model'),
+        Item('CS-02', 'AAA login and sessions', ('aaa authentication ', 'line vty ', 'line con ', 'login ', 'aaa new-model'),
              ('show running-config', 'show users'),
              'Review every VTY/console method list, fallback, timeout and failed-login control; verify actual login and MFA evidence without changing AAA.'),
         Item('CS-03', 'Management access sources', ('line vty ', 'access-list ', 'ip access-list ', 'ipv6 access-list ', 'interface ', 'vrf '),
@@ -96,14 +96,20 @@ def evaluate(result, platform, device_id='D0001'):
                 matching.append(f'{command}: {value}')
         # Keep the checklist compact. The device's detailed configuration and
         # evidence rows remain available immediately below in the same report.
-        observation = '\n'.join(dict.fromkeys(matching))[:8000] or 'No matching device fields were extracted.'
+        joined = '\n'.join(dict.fromkeys(matching))
+        observation = (joined[:2000] + '\n[Observation truncated; see evidence rows.]'
+                       if len(joined) > 2000 else joined) or 'No matching device fields were extracted.'
         ids = [evidence_ids[command] for command in item.commands if command in evidence_ids]
+        attention = (
+            (item.id == 'CS-03' and any('transport input ' in value.lower() and
+                                        ('telnet' in value.lower() or value.lower().endswith(' all')) for value in matching))
+            or (item.id == 'CS-02' and any(value.lower().endswith(' / no login') for value in matching))
+        )
         if item.manual:
             status = 'Manual verification'
         elif not matching:
             status = 'Not collected'
-        elif item.id == 'CS-03' and any('transport input ' in value.lower() and
-                                       ('telnet' in value.lower() or value.lower().endswith(' all')) for value in matching):
+        elif attention:
             status = 'Attention'
         else:
             status = 'Needs review'

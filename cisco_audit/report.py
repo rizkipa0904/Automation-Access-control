@@ -1,12 +1,16 @@
 """Build one readable, sanitized audit sheet grouped by device IP."""
 from collections import Counter
+from datetime import datetime, timezone
 from io import BytesIO
 import re
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.worksheet.hyperlink import Hyperlink
 
+from . import __version__
 from .core import safe_text
 from .checklist import evaluate
 
@@ -14,8 +18,10 @@ from .checklist import evaluate
 COLUMNS = (
     'IP / device', 'Section', 'Check / item', 'Sanitized result', 'Status',
     'Evidence ID', 'Read-only command', 'Scope / follow-up', 'Collected (UTC)',
+    'Auditor decision', 'Owner', 'Reviewer comment', 'Review date',
 )
-WIDTHS = (23, 20, 35, 74, 18, 20, 28, 62, 24)
+WIDTHS = (23, 20, 35, 74, 18, 20, 28, 62, 24, 18, 18, 40, 16)
+LAST_COLUMN = len(COLUMNS)
 NAVY = '14283E'
 NAVY_LIGHT = '203B56'
 TEAL = '087E78'
@@ -42,7 +48,7 @@ def _meta(ws, row, left_label, left_value, right_label, right_value):
     ws.merge_cells(start_row=row, start_column=2, end_row=row, end_column=4)
     ws.cell(row, 2, _excel_value(left_value))
     ws.cell(row, 5, right_label)
-    ws.merge_cells(start_row=row, start_column=6, end_row=row, end_column=9)
+    ws.merge_cells(start_row=row, start_column=6, end_row=row, end_column=LAST_COLUMN)
     ws.cell(row, 6, _excel_value(right_value))
     for column in (1, 5):
         cell = ws.cell(row, column)
@@ -67,6 +73,11 @@ def _device_identity(result, evtext, platform):
 
 def workbook(run):
     wb = Workbook()
+    wb.properties.title = 'Network Access Review'
+    wb.properties.subject = 'Read-only administrative access evidence'
+    wb.properties.creator = 'Network Access Review'
+    wb.properties.description = ('Sanitized, read-only device evidence. '
+                                 'This workbook is not a compliance certification.')
     ws = wb.active
     ws.title = 'Audit Results'
     ws.sheet_properties.tabColor = TEAL
@@ -78,13 +89,13 @@ def workbook(run):
     ws.print_options.horizontalCentered = True
     ws.print_title_rows = '1:11'
 
-    ws.merge_cells('A1:I1')
+    ws.merge_cells(f'A1:{get_column_letter(LAST_COLUMN)}1')
     ws['A1'] = 'NETWORK ACCESS REVIEW  /  AUDIT RESULTS'
     ws['A1'].fill = PatternFill('solid', fgColor=NAVY)
     ws['A1'].font = Font(name='Aptos Display', bold=True, size=18, color=WHITE)
     ws['A1'].alignment = Alignment(vertical='center', indent=1)
     ws.row_dimensions[1].height = 43
-    ws.merge_cells('A2:I2')
+    ws.merge_cells(f'A2:{get_column_letter(LAST_COLUMN)}2')
     ws['A2'] = 'One sheet · each device grouped by IP · sanitized, read-only collection'
     ws['A2'].font = Font(name='Aptos', size=10, color=TEAL, italic=True)
     ws['A2'].alignment = Alignment(vertical='center', indent=1)
@@ -98,12 +109,17 @@ def workbook(run):
     _meta(ws, 7, 'SSH profile', 'Legacy compatibility' if run.get('legacy') else 'Modern', 'Rerun of', run.get('rerun_of') or 'Original scan')
     counts = Counter(result.get('status', 'unknown') for result in results)
     _meta(ws, 8, 'Device status', ' · '.join(f'{status}: {count}' for status, count in sorted(counts.items())) or 'No devices', 'Evidence', 'Filtered output only')
-    ws.merge_cells('A9:I9')
-    ws['A9'] = 'Observed means extracted, not compliant. Missing evidence does not prove a control is absent. MFA enforcement requires independent provider-side verification.'
+    generated = datetime.now(timezone.utc).isoformat(timespec='seconds')
+    _meta(ws, 10, 'Tool version', __version__, 'Report generated (UTC)', generated)
+    ws.merge_cells(f'A9:{get_column_letter(LAST_COLUMN)}9')
+    ws['A9'] = ('Observed means extracted, not compliant. Missing evidence does not prove a control is absent. '
+                'Status legend: Observed = filtered field extracted; Attention = visible condition to review; '
+                'Not Available / Not collected = not established from this snapshot; Manual verification = external records required. '
+                'MFA enforcement requires independent provider-side verification.')
     ws['A9'].font = Font(name='Aptos', size=10, color=NAVY_LIGHT, italic=True)
     ws['A9'].fill = PatternFill('solid', fgColor=PALE)
     ws['A9'].alignment = Alignment(wrap_text=True, vertical='center', indent=1)
-    ws.row_dimensions[9].height = 34
+    ws.row_dimensions[9].height = 52
 
     for col, heading in enumerate(COLUMNS, 1):
         cell = ws.cell(11, col, heading)
@@ -112,7 +128,7 @@ def workbook(run):
         cell.alignment = Alignment(vertical='center', wrap_text=True, indent=1)
     ws.row_dimensions[11].height = 31
     for col, width in enumerate(WIDTHS, 1):
-        ws.column_dimensions[chr(64 + col)].width = width
+        ws.column_dimensions[get_column_letter(col)].width = width
 
     evidence_rows = {}
     evidence_references = []
@@ -131,7 +147,7 @@ def workbook(run):
         hostname, identity = _device_identity(result, evtext, device_platform)
 
         band = ws.max_row + 2
-        ws.merge_cells(start_row=band, start_column=1, end_row=band, end_column=9)
+        ws.merge_cells(start_row=band, start_column=1, end_row=band, end_column=LAST_COLUMN)
         title = f'{number:02d}  /  {endpoint}    ·    {hostname or "Hostname unavailable"}    ·    {device_platform.upper()}    ·    {status.upper()}'
         cell = ws.cell(band, 1, _excel_value(title))
         cell.fill = PatternFill('solid', fgColor=TEAL if status == 'completed' else NAVY_LIGHT)
@@ -140,9 +156,9 @@ def workbook(run):
         ws.row_dimensions[band].height = 32
 
         def add_row(section, check, value, state='', eid='', command='', note='', collected=timestamp):
-            row = _append(ws, [endpoint, section, check, value, state, eid, command, note, collected])
+            row = _append(ws, [endpoint, section, check, value, state, eid, command, note, collected, '', '', '', ''])
             ws.row_dimensions[row].height = 43 if section == 'Evidence' else 33
-            for col in range(1, 10):
+            for col in range(1, LAST_COLUMN + 1):
                 c = ws.cell(row, col)
                 c.font = Font(name='Aptos', size=10, color=TEXT, bold=(col == 2))
                 c.alignment = Alignment(wrap_text=True, vertical='top', indent=1)
@@ -208,13 +224,17 @@ def workbook(run):
             aaa = '\n'.join(line for line in fact_lines if line.lower().startswith('aaa '))
             add_check('AAA and method lists', facts_source, aaa,
                       'Visible configuration only; external server operation is not verified.')
-            external = '\n'.join(line for line in fact_lines if re.match(r'(?i)^(?:aaa authentication|aaa authorization|aaa accounting|aaa group server|radius server|tacacs server)', line))
+            external = '\n'.join(line for line in fact_lines if re.match(r'(?i)^(?:aaa authentication|aaa authorization|aaa accounting|aaa group server|radius server|tacacs server|radius-server|tacacs-server)', line))
             mfa = ('External RADIUS/TACACS+ references observed:\n' + external + '\nProvider MFA enforcement was not verified.'
                    if external else 'No external RADIUS/TACACS+ reference was extracted; MFA enforcement cannot be determined.')
             add_check('MFA enforcement', facts_source, mfa,
                       'Device configuration does not prove a second-factor challenge or provider policy.', force_unavailable=True)
             vty = '\n'.join(line for line in fact_lines if line.lower().startswith('line vty '))
-            attention = any(' / transport input ' in line.lower() and ('telnet' in line.lower() or line.lower().endswith(' all')) for line in fact_lines)
+            attention = any(
+                (' / transport input ' in line.lower()
+                 and ('telnet' in line.lower() or line.lower().endswith(' all')))
+                or line.lower().endswith(' / no login')
+                for line in fact_lines)
             add_check('VTY access and transport', facts_source, vty,
                       'Filtered VTY fields; ACL definitions and all access paths may be incomplete.', attention=attention)
             ssh = evtext.get('show ip ssh', '')
@@ -267,7 +287,14 @@ def workbook(run):
         if row:
             cell.hyperlink = Hyperlink(ref=cell.coordinate, location=f"'Audit Results'!A{row}", display=eid)
             cell.font = Font(name='Aptos', size=10, color=TEAL, underline='single')
-    ws.print_area = f'A1:I{ws.max_row}'
+    ws.print_area = f'A1:{get_column_letter(LAST_COLUMN)}{ws.max_row}'
+    decision = DataValidation(type='list', formula1='"Pass,Fail,Needs review,Not available"', allow_blank=True)
+    decision.errorTitle = 'Invalid decision'
+    decision.error = 'Select Pass, Fail, Needs review, or Not available.'
+    decision.promptTitle = 'Auditor decision'
+    decision.prompt = 'Record the auditor decision for this row.'
+    ws.add_data_validation(decision)
+    decision.add(f'J12:J{max(ws.max_row, 12)}')
     output = BytesIO()
     wb.save(output)
     return output.getvalue()

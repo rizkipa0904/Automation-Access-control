@@ -200,6 +200,15 @@ const settle=()=>new Promise(resolve=>setImmediate(resolve));
   elements.rerun.onclick();
   assert.equal(elements.platform.value,'cisco');
   assert.equal(elements.password.value,'');
-  assert(requests.every(x=>x.opts.headers['X-Session-Token']==='token')); 
+  // A run whose revision did not change is not downloaded again.
+  const beforeRevisionPolls = requests.filter(x=>x.url==='/runs/r4').length;
+  runs.r4.revision = 7; projects[2].runs[0].revision = 7;
+  await vm.runInContext('refresh()',ctx);
+  const afterFirstRevisionPoll = requests.filter(x=>x.url==='/runs/r4').length;
+  await vm.runInContext('refresh()',ctx);
+  const afterSecondRevisionPoll = requests.filter(x=>x.url==='/runs/r4').length;
+  assert.equal(afterFirstRevisionPoll, beforeRevisionPolls + 1);
+  assert.equal(afterSecondRevisionPoll, afterFirstRevisionPoll);
+  assert(requests.every(x=>x.opts.headers['X-Session-Token']==='token'));
   console.log('UI simulation passed: projects, reruns, scan deletion, status totals, scroll preservation, and sanitized preview.');
 })().catch(err=>{console.error(err);process.exitCode=1;});
