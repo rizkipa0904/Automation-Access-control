@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="session-token" content="__SESSION_TOKEN__">
+  <title>Network Access Review</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="container topbar-inner">
+    <div class="brand"><span class="brand-mark" aria-hidden="true">C<span>·</span></span><div><strong>Access Review</strong><span>Cisco &amp; Palo Alto</span></div></div>
+    <div class="topbar-tag"><span class="status-dot"></span> LOCAL WORKSPACE</div>
+  </div>
+</header>
+<main class="container">
+  <div class="page-heading">
+    <div><div class="eyebrow">NETWORK SECURITY / ACCESS REVIEW</div><h1>Device access review</h1><p>Prepare targets, collect evidence over SSH, and download audit results.</p></div>
+    <div class="heading-meta"><span class="meta-icon" aria-hidden="true">✓</span><div><strong>Read-only collection</strong><span>Restricted read commands</span></div></div>
+  </div>
+  <div class="notice"><span class="notice-icon" aria-hidden="true">i</span><div><strong>Before you begin</strong><p>Use a read-only account and verify host keys through a trusted source. Credentials are processed locally and are never included in Excel. Sanitized results are saved locally and should be protected.</p></div></div>
+  <div class="app-layout">
+    <aside class="project-sidebar" aria-label="Projects">
+      <div class="sidebar-heading"><div class="section-icon" aria-hidden="true">P</div><div><h2>Projects</h2><p>Your access review workspaces</p></div></div>
+      <div class="sidebar-pane">
+        <div class="sidebar-create"><label for="project-name">New project</label><input id="project-name" maxlength="100" placeholder="Project name" aria-label="Project name"><button id="create-project" type="button">+ New project</button><p id="project-error" class="error" role="alert"></p><p id="storage-error" class="error" role="alert"></p></div>
+        <div class="sidebar-section"><div id="projects" class="project-list"><p class="empty-state">No projects yet. Create one to get started.</p></div></div>
+      </div>
+      <div class="sidebar-note"><strong>Local and read-only</strong><p>Commands are restricted to the built-in allowlist. No telemetry is sent.</p></div>
+    </aside>
+    <div class="main-column">
+      <section class="card project-dashboard" aria-labelledby="selected-project"><div class="dashboard-heading"><div><div class="eyebrow">PROJECT WORKSPACE</div><h2 id="selected-project">Select a project</h2><p id="summary" class="summary">Choose a project to view its access review status.</p></div><div class="actions"><button id="download" disabled>Download report ↓</button><button id="cancel" class="secondary" disabled>Cancel scan</button></div></div><div id="status-cards" class="status-cards"></div><div class="scan-history"><span class="project-label">SCAN HISTORY</span><div id="scans" class="scan-list"><p class="empty-state">Select a project to see its scans.</p></div></div><div class="dashboard-results"><div class="dashboard-results-heading"><div><h3>Devices and access control status</h3><p>Select a device to open its live activity and filtered evidence.</p></div><button type="button" class="secondary" id="toggle-new-scan">New scan</button></div><div id="results" class="results"></div></div><p id="error" class="error" role="alert"></p><p class="small dashboard-note">Project data and reports may contain sensitive audit information. Restrict access to their storage location. A completed scan does not imply compliance.</p></section>
+      <div id="scan-form" hidden>
+      <div class="workspace">
+        <section class="card input-card" aria-labelledby="devices-title">
+          <div class="card-heading"><div class="section-icon" aria-hidden="true">01</div><div><h2 id="devices-title">New scan</h2><p>Targets and credentials are used for the selected project and cleared when you switch projects.</p></div></div>
+          <div class="form-content">
+            <div class="active-project"><span class="active-project-label">ACTIVE PROJECT</span><strong id="active-project-name">Select a project in the sidebar</strong></div>
+            <div class="field"><label for="platform">Device platform</label><select id="platform" required><option value="">Select a device platform</option><option value="cisco">Cisco Switch · IOS / IOS XE</option><option value="paloalto">Palo Alto Firewall · PAN-OS</option></select><p class="field-hint">One platform per scan. Select the platform shared by all targets.</p></div>
+            <div class="field"><label for="mode">Input mode</label><select id="mode"><option value="shared">Bulk · shared credentials</option><option value="individual">Bulk · credentials per device</option></select><p class="field-hint">Up to 200 devices per scan; at most 5 concurrent SSH connections across all projects.</p></div>
+            <div id="shared"><div class="field"><label for="ips">IP addresses</label><textarea id="ips" placeholder="192.0.2.10&#10;192.0.2.11,22" rows="5" aria-describedby="ip-hint"></textarea><p class="field-hint" id="ip-hint">One address per line. Optional port format: IP,port.</p></div><div class="grid"><div class="field"><label for="username">Username</label><input id="username" autocomplete="off" placeholder="Enter username"></div><div class="field"><label for="password">Password</label><input id="password" type="password" autocomplete="new-password" placeholder="Enter password"></div></div></div>
+            <div id="individual" hidden><p class="field-hint csv-hint">Fill in the table or import a CSV with the header <code>ip,port,username,password</code>. The template contains examples that must be replaced. CSV files contain plaintext passwords; protect and remove the source file according to your policy.</p><div class="toolbar"><label class="file">Import CSV<input id="csv" type="file" accept=".csv,text/csv"></label><button type="button" class="secondary" id="add">+ Add row</button><button type="button" class="secondary" id="template">Download template</button></div><div class="table-wrap"><table><thead><tr><th>IP address</th><th>Port</th><th>Username</th><th>Password</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody id="rows"></tbody></table></div></div>
+            <div class="legacy-option" id="legacy-option" hidden><input id="legacy" type="checkbox"><div><label for="legacy">Legacy SSH compatibility</label><p>Enable only for trusted devices that require it. Older algorithms are weaker; host key verification remains required. Applies to every device in the scan.</p></div></div>
+          </div>
+          <div class="card-footer"><div class="actions"><button id="start">Start review <span aria-hidden="true">→</span></button><button id="clear" class="text-button">Clear credentials</button></div></div>
+        </section>
+        <aside class="guide" aria-label="Quick guide"><div class="guide-label">REVIEW FLOW</div><h2>From device to evidence</h2><ol><li><span>1</span><div><strong>Prepare targets</strong><p>Enter device IPs and credentials.</p></div></li><li><span>2</span><div><strong>Verify and collect</strong><p>Check host keys and start the review.</p></div></li><li><span>3</span><div><strong>Review results</strong><p>Download the workbook and review the scan.</p></div></li></ol><div class="guide-note"><strong>Keep data protected</strong><p>Sanitized project data is stored locally in .access-review-data/. Use a trusted computer and restrict access to this folder.</p></div></aside>
+      </div>
+      </div>
+    </div>
+  </div>
+</main>
+<footer class="container"><span>Network Access Review</span><span>Runs on this computer · No telemetry</span></footer>
+</body>
+</html>

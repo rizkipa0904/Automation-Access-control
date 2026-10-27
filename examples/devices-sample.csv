@@ -1,0 +1,3 @@
+ip,port,username,password
+192.0.2.10,22,auditor1,CONTOH_PASSWORD_1
+192.0.2.11,,auditor2,CONTOH_PASSWORD_2
