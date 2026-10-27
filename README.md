@@ -19,8 +19,8 @@ The app binds to `127.0.0.1` on a dynamically selected port. Keep the terminal o
 ### First-time setup
 
 ```bash
-git clone https://github.com/rizkipa0904/Automation-Access-control-.git
-cd Automation-Access-control-
+git clone https://github.com/rizkipa0904/Automation-Access-control.git
+cd Automation-Access-control
 python3 start.py
 ```
 
@@ -33,13 +33,13 @@ Keep the terminal open while scans run. Press **Ctrl+C** in that terminal to sto
 Open a terminal and run:
 
 ```bash
-cd /path/to/Automation-Access-control-
+cd /path/to/Automation-Access-control
 git status --short
 git pull --ff-only origin main
 python3 start.py
 ```
 
-Replace `/path/to/Automation-Access-control-` with the folder where you cloned the project. `--ff-only` avoids creating a merge commit. If Git says local changes would be overwritten, back up or commit those changes before pulling; do not discard work you need. If the clone tracks another branch, check it with `git branch --show-current` and use the matching branch name after `origin`.
+Replace `/path/to/Automation-Access-control` with the folder where you cloned the project. `--ff-only` avoids creating a merge commit. If Git says local changes would be overwritten, back up or commit those changes before pulling; do not discard work you need. If the clone tracks another branch, check it with `git branch --show-current` and use the matching branch name after `origin`.
 
 To refresh the app after pulling, stop the old process with **Ctrl+C**, pull the changes, and run `python3 start.py` again. The launcher installs changed pinned dependencies when needed.
 
