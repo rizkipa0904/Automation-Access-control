@@ -74,14 +74,14 @@ def workbook(run):
         for issue in result.get('issues', []):
             _append(issues, [did, safe_text(issue.get('command')), safe_text(issue.get('message')), 'Data may be incomplete'])
 
-        def add(check, source, value, limitation, attention=False):
+        def add(check, source, value, limitation, attention=False, force_unavailable=False):
             """Never infer compliance or absence from missing/sanitized output."""
             available = bool(value and source in evmap and not evtext.get(source, '').startswith('[') and not value.startswith('['))
-            state = ('Attention' if attention else 'Observed') if available else 'Not Available'
-            observed = value if available else 'No data could be extracted from this command.'
+            state = 'Not Available' if force_unavailable else ('Attention' if attention else 'Observed') if available else 'Not Available'
+            observed = value if available or force_unavailable else 'No data could be extracted from this command.'
             if len(observed) > 32000:
                 limitation += ' The result was truncated at the Excel cell limit; related evidence may also be truncated.'
-            _append(results, [did, check, state, safe_text(observed), evmap.get(source, '') if available else '', source, t if available else '', limitation])
+            _append(results, [did, check, state, safe_text(observed), evmap.get(source, '') if available or (force_unavailable and source in evmap) else '', source, t if available or (force_unavailable and source in evmap) else '', limitation])
 
         raw_facts = [f.get('text', '') if isinstance(f, dict) else f for f in result.get('facts', [])]
         raw_accounts = result.get('accounts', [])
@@ -90,6 +90,9 @@ def workbook(run):
             add('Local accounts and privilege', account_source, account_lines, 'Only extracted local accounts are shown; status, ownership, and external AAA permissions are not proven.')
             aaa_facts = '\n'.join(f for f in raw_facts if f.lower().startswith('aaa '))
             add('AAA and method lists', facts_source, aaa_facts, 'Only visible configuration is shown; AAA server effectiveness is not proven.')
+            external_aaa = '\n'.join(f for f in raw_facts if re.match(r'(?i)^(?:aaa authentication|aaa authorization|aaa accounting|aaa group server|radius server|tacacs server)', f))
+            mfa_summary = ('External RADIUS/TACACS+ authentication references were observed:\n' + external_aaa + '\nMFA enforcement is controlled by the external provider and cannot be verified from this device snapshot.' if external_aaa else 'No external RADIUS/TACACS+ authentication reference was extracted. MFA enforcement cannot be determined from this snapshot.')
+            add('MFA enforcement', facts_source, mfa_summary, 'The device configuration does not prove an external identity provider prompts for or enforces a second factor.', force_unavailable=True)
             vty = '\n'.join(f for f in raw_facts if f.lower().startswith('line vty '))
             attention = any(' / transport input ' in f.lower() and ('telnet' in f.lower() or f.lower().endswith(' all')) for f in raw_facts)
             add('VTY access and transport', facts_source, vty, 'Filtered VTY fields; not all lines and ACL definitions may be covered.', attention)
@@ -100,6 +103,8 @@ def workbook(run):
             add('Administrators from configuration', account_source, account_lines, 'Visible fields only; effective access and administrator completeness are not proven.')
             fact_lines = '\n'.join(raw_facts)
             add('Administrator access configuration', facts_source, fact_lines, 'Filtered fields; configuration and effective access may be incomplete.')
+            auth_lines = '\n'.join(f for f in raw_facts if f.lower().startswith(('admin ', 'authentication-profile ')))
+            add('Administrator authentication and MFA', facts_source, auth_lines or 'No authentication-profile or per-admin authentication reference was extracted. MFA status is not established.', 'Authentication profile references are configuration clues only. External RADIUS/SAML policy and actual MFA enforcement are not verified.', force_unavailable=True)
             listed = '\n'.join(f"{a.get('username', '')}" for a in raw_accounts if a.get('source') == 'show admins all')
             add('Administrators known to the device', 'show admins all', listed, 'The list may include local, remote, and Panorama admins; it does not prove all effective permissions.')
     colors = {'Observed': 'DDEFEA', 'Attention': 'FCE8C8', 'Not Available': 'E9EEF3', 'failed': 'FCE6E6', 'partial': 'FCE8C8'}

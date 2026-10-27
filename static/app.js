@@ -173,6 +173,36 @@ function renderProjects(projects) {
   }
 }
 function timeLabel(value) { return value && value.length >= 19 ? value.slice(11,19) : '--:--:--'; }
+function renderAccessChecks(run, device) {
+  const section=node('section','access-checks');
+  section.append(node('div','preview-heading','ACCESS CONTROL REVIEW'));
+  const facts=device.facts||[], accounts=device.accounts||[];
+  const add=(label,value,state='Observed')=>{const row=node('div','access-check');row.append(node('strong','',label),node('span','check-status '+state.toLowerCase().replaceAll(' ','-'),state),node('p','',value));section.append(row);};
+  if(run.platform==='cisco') {
+    const users=accounts.map(a=>`${a.username} · privilege ${a.privilege||'unspecified'}`).join('\n');
+    add('Local configured accounts',users||'No local account entries could be extracted.',users?'Observed':'Not available');
+    const aaa=facts.filter(f=>/^(aaa |radius server |tacacs server )/i.test(f)).join('\n');
+    add('AAA, RADIUS, and TACACS+',aaa||'No approved AAA or external server fields were extracted.',aaa?'Observed':'Not available');
+    const vty=facts.filter(f=>/^line vty /i.test(f)).join('\n');
+    add('VTY access controls',vty||'No approved VTY access fields were extracted.',vty?'Observed':'Not available');
+    const ssh=(device.evidence||[]).find(e=>e.command==='show ip ssh');
+    add('SSH service',ssh?.text||'SSH state was not available from the collected output.',ssh&&!ssh.text.startsWith('[')?'Observed':'Not available');
+    const ext=facts.filter(f=>/^(aaa (authentication|authorization|accounting)|aaa group server|radius server|tacacs server)/i.test(f));
+    add('MFA enforcement',ext.length?`External AAA references were observed (${ext.length}). The RADIUS/TACACS+ provider policy and any second-factor challenge were not checked.`:'No external RADIUS/TACACS+ reference was extracted. MFA state cannot be determined from this device snapshot.','Not verified');
+  } else {
+    const admins=accounts.map(a=>`${a.username} · ${a.privilege||'role unknown'}${a.source==='show admins all'?' · known to device':''}`).join('\n');
+    add('Administrators known to the device',admins||'No administrator names were extracted.');
+    const auth=facts.filter(f=>/^(admin .* (role|authentication-profile)|authentication-profile )/i.test(f)).join('\n');
+    add('Administrator roles and authentication profiles',auth||'Roles and authentication-profile references were not available.',auth?'Observed':'Not available');
+    const external=facts.filter(f=>/^authentication-profile .* method (radius|saml|ldap|tacplus|kerberos)$/i.test(f));
+    const factors=facts.filter(f=>/^authentication-profile .* (additional-factors-enabled|additional-factor-profile)/i.test(f));
+    const mfaText=[external.length?`External authentication profile(s) observed: ${external.map(x=>x.replace(/^authentication-profile /,'')).join('; ')}.`:'No external MFA provider policy was verified.',factors.length?'Additional-factor profile fields were present, but that does not prove they apply to administrator sign-in.':'', 'Verify administrator MFA through the configured RADIUS/SAML provider and the organization policy.'].filter(Boolean).join(' ');
+    add('Administrator MFA',mfaText,'Not verified');
+    const security=facts.filter(f=>/^(password-complexity |management )/i.test(f)).join('\n');
+    add('Password and management controls',security||'No approved password-complexity or management fields were extracted.',security?'Observed':'Not available');
+  }
+  return section;
+}
 function renderDeviceDetail(run, device, index) {
   const panel = node('section','device-detail');
   const title = node('div','detail-heading');
@@ -191,6 +221,7 @@ function renderDeviceDetail(run, device, index) {
   }
   panel.append(terminal, node('p','terminal-footnote','Commands are shown as they run. Device output appears only after sensitive values are filtered.'));
   const detail = node('div','device-body');
+  detail.append(renderAccessChecks(run,device));
   for (const issue of device.issues || []) detail.append(node('p','issue',`${issue.command ? issue.command+': ' : ''}${issueText(issue.message)}`));
   if (device.host_key) {
     detail.append(node('p','host-warning','Verify this fingerprint through a trusted source before approving it.'),node('p','key',`${device.host_key.type} · ${device.host_key.fingerprint}`));

@@ -47,6 +47,17 @@ class WorkbookTests(unittest.TestCase):
         self.assertIn('ipv6 access-class', rows['VTY access and transport'][3])
         self.assertEqual(rows['SSH status'][2], 'Observed')
 
+    def test_mfa_is_never_asserted_from_an_external_aaa_reference(self):
+        facts = ['aaa authentication login default group RAD-AUTH local', 'radius server RAD-1']
+        result = {'ip':'192.0.2.10','port':22,'status':'completed',
+                  'evidence':[{'command':'show running-config','text':'aaa authentication login default group RAD-AUTH local\nradius server RAD-1','status':'filtered'}],
+                  'accounts':[],'facts':facts,'issues':[]}
+        wb = self.load('cisco', result)
+        row = next(row for row in list(wb['Scan Results'].values)[1:] if row[1] == 'MFA enforcement')
+        self.assertEqual(row[2], 'Not Available')
+        self.assertIn('MFA enforcement is controlled by the external provider', row[3])
+        self.assertEqual(row[4], 'D0001-E01')
+
     def test_large_evidence_is_explicitly_marked_truncated(self):
         text = 'x' * 33000
         result = {'ip': '192.0.2.7', 'port': 22, 'status': 'completed', 'evidence': [{'command': 'show ip ssh', 'text': text, 'status': 'filtered'}], 'accounts': [], 'facts': [], 'issues': []}
@@ -87,6 +98,17 @@ class WorkbookTests(unittest.TestCase):
         self.assertEqual(wb['Accounts']['F2'].value, 'D0001-E03')
         self.assertNotIn('superuser', rows['Administrators known to the device'][3])
         self.assertIn('admin1', rows['Administrators from configuration'][3])
+
+    def test_palo_external_profile_does_not_claim_mfa_enforcement(self):
+        facts=['admin admin authentication-profile corp-radius','authentication-profile corp-radius method radius']
+        result={'ip':'192.0.2.30','port':22,'status':'completed','platform':'paloalto',
+                'evidence':[{'command':'show config running','text':'\n'.join(facts),'status':'filtered'}],
+                'accounts':[],'facts':facts,'issues':[]}
+        wb=self.load('paloalto',result)
+        row=next(row for row in list(wb['Scan Results'].values)[1:] if row[1]=='Administrator authentication and MFA')
+        self.assertEqual(row[2],'Not Available')
+        self.assertIn('RADIUS/SAML policy and actual MFA enforcement are not verified',row[7])
+        self.assertIn('method radius',row[3])
 
 if __name__ == '__main__':
     unittest.main()

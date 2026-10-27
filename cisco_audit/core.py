@@ -98,7 +98,16 @@ def extract_config(raw):
     for line in raw.splitlines():
         s = line.strip()
         if not line.startswith((' ', '\t')):
-            context = s if re.fullmatch(r'line vty [0-9 ]+', s, re.I) else ''
+            if re.fullmatch(r'line vty [0-9 ]+', s, re.I):
+                context = s
+            elif re.fullmatch(r'(?:radius|tacacs) server [A-Za-z0-9_.-]{1,64}', s, re.I):
+                context = s
+                facts.append(s)
+            elif re.fullmatch(r'aaa group server (?:radius|tacacs\+) [A-Za-z0-9_.-]{1,64}', s, re.I):
+                context = s
+                facts.append(s)
+            else:
+                context = ''
         m = re.match(r'^username\s+(\S+)(?:\s+privilege\s+(\d+))?', s, re.I)
         if m:
             # Username is potentially attacker-controlled; limit its character set.
@@ -122,6 +131,22 @@ def extract_config(raw):
         )
         if context and any(re.fullmatch(pattern, s, re.I) for pattern in vty_patterns):
             facts.append(context + ' / ' + s)
+        elif context.lower().startswith(('radius server ', 'tacacs server ')):
+            address = re.fullmatch(r'address ipv4 ([0-9.]{7,15})(?: auth-port (\d{1,5}))?(?: acct-port (\d{1,5}))?', s, re.I)
+            if address:
+                try:
+                    host = str(ipaddress.IPv4Address(address.group(1)))
+                    ports = ''
+                    for label, port in zip(('auth-port', 'acct-port'), address.groups()[1:]):
+                        if port and 1 <= int(port) <= 65535:
+                            ports += f' {label} {port}'
+                    facts.append(context + ' address ipv4 ' + host + ports)
+                except ValueError:
+                    pass
+        elif context.lower().startswith('aaa group server '):
+            server = re.fullmatch(r'server name ([A-Za-z0-9_.-]{1,64})', s, re.I)
+            if server:
+                facts.append(context + ' / server name ' + server.group(1))
         elif _safe_aaa_fact(s):
             facts.append(s)
         elif re.fullmatch(r'ip ssh version [12]', s, re.I):
@@ -237,6 +262,28 @@ def extract_palo_config(raw):
             value = (node.text or '').strip()
             if node.tag in ('enabled', 'minimum-length', 'minimum-uppercase-letters', 'minimum-lowercase-letters', 'minimum-numeric-letters', 'minimum-special-characters', 'minimum-different-characters', 'expiration-period', 'block-repeated-characters', 'password-history-count') and re.fullmatch(r'(?:yes|no|[0-9]{1,5})', value, re.I):
                 facts.append('password-complexity ' + node.tag + ' ' + value)
+    # Authentication-profile metadata is useful for tracing admin auth routes,
+    # but it cannot prove that an external provider actually enforces MFA.
+    auth_profiles = root.find('./mgt-config/authentication-profile')
+    if auth_profiles is not None:
+        methods = {'local', 'radius', 'ldap', 'tacplus', 'kerberos', 'saml', 'none'}
+        for entry in auth_profiles.findall('./entry'):
+            profile_name = entry.get('name', '')
+            if not re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', profile_name):
+                continue
+            method_node = entry.find('./method')
+            method = next((child.tag.lower() for child in list(method_node) if child.tag.lower() in methods), '') if method_node is not None else ''
+            if method:
+                facts.append('authentication-profile ' + profile_name + ' method ' + method)
+            factors = entry.find('./factors')
+            if factors is not None:
+                enabled = factors.findtext('./enable', default='').strip().lower()
+                if enabled in ('yes', 'no'):
+                    facts.append('authentication-profile ' + profile_name + ' additional-factors-enabled ' + enabled)
+                for factor in factors.findall('.//entry'):
+                    factor_name = factor.get('name', '')
+                    if re.fullmatch(r'[A-Za-z0-9_.@-]{1,128}', factor_name):
+                        facts.append('authentication-profile ' + profile_name + ' additional-factor-profile ' + factor_name)
     for device in root.findall('./devices/entry'):
         # Select only exact, non-secret management settings; absence remains unknown.
         system = device.find('./deviceconfig/system')

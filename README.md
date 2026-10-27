@@ -1,103 +1,169 @@
 # Network Access Review
 
-Tool lokal berbasis browser untuk mempercepat pengumpulan dan review informasi akses administratif pada **Cisco switch IOS / IOS XE** dan **Palo Alto Networks firewall PAN-OS**. Pilih platform, masukkan satu atau banyak IP beserta kredensial, lalu unduh hasil scan sebagai Excel.
+A local, read-only SSH tool for collecting and reviewing administrative access evidence from Cisco IOS / IOS XE switches and Palo Alto Networks PAN-OS firewalls. It organizes work by project, displays per-device status and sanitized live activity, and exports an Excel workbook for review.
 
-Aplikasi menggunakan SSH dan hanya mengirim perintah baca yang tercantum dalam daftar tetap di bawah. Tidak ada fitur untuk mengirim perintah bebas, mengubah konfigurasi, atau mentransfer file. Gunakan akun dengan hak read-only dan pembatasan command di perangkat sebagai kontrol tambahan.
+This is an evidence collection aid, not a compliance certification. It does not make configuration changes, test authentication against external providers, or prove that an observed control is effective.
 
-> **Status validasi:** kompatibilitas belum diuji pada semua model dan versi; belum ada jaminan dukungan semua versi PAN-OS, IOS, maupun IOS XE. Perbedaan privilege, format output, prompt dan algoritma SSH dapat menyebabkan hasil parsial. Uji pada lab dan perangkat yang relevan sebelum penggunaan produksi.
+## Requirements
 
-## Persiapan
+- macOS or Linux with Python 3.10 or newer, `venv`, `pip`, Git, and a modern browser.
+- Network reachability from this computer to the authorized devices over SSH.
+- A dedicated read-only account. Restrict its command privileges on the device as a separate control.
+- A trusted way to verify each SSH host key fingerprint.
+- Python package index access on first setup, or an administrator-prepared offline wheelhouse.
 
-- Linux atau macOS, Python **3.10+** dengan modul `venv` dan `pip`, Git, browser, dan jaringan SSH ke perangkat yang diotorisasi.
-- Akun perangkat **read-only** dengan akses ke perintah yang dibutuhkan. Untuk PAN-OS, periksa bahwa peran read-only yang dipilih memiliki akses ke command yang tercantum; untuk Cisco batasi juga melalui AAA command authorization. Hak kurang dapat menghasilkan output parsial tanpa selalu menampilkan error.
-- Fingerprint host key dari sumber yang dipercaya dan terpisah, untuk setiap perangkat.
-- Akses ke Python package index untuk instalasi awal, atau dependensi dalam wheel yang telah disiapkan administrator dan dikonfigurasi melalui mekanisme pip. Aplikasi tidak memerlukan layanan cloud dan tidak mengirim telemetry.
+The app binds to `127.0.0.1` on a dynamically selected port. Keep the terminal open while using it; it is not a shared or remote web server.
 
-## Instalasi dan menjalankan
+## Clone and run
 
-Clone repositori setelah dipublikasikan. Ganti placeholder dengan URL dan nama direktori sebenarnya:
+### First-time setup
 
 ```bash
-git clone <URL-REPOSITORI>
-cd <NAMA-DIREKTORI>
+git clone https://github.com/rizkipa0904/Automation-Access-control-.git
+cd Automation-Access-control-
 python3 start.py
 ```
 
-Pada peluncuran pertama, command membuat `.venv` dan memasang dependensi; berikutnya command yang sama menjalankan aplikasi. Terminal menampilkan URL seperti `http://127.0.0.1:54321/` dengan port aktual yang dipilih otomatis. Jika browser tidak terbuka, buka URL yang ditampilkan pada **komputer yang sama**. Biarkan terminal terbuka dan tekan **Ctrl+C** saat selesai. Aplikasi hanya listen di loopback dan tidak dirancang sebagai server bersama.
+On first launch, `start.py` creates `.venv`, installs the pinned dependencies from `requirements.txt`, and starts the app. Later launches use the same command. The terminal prints a local URL such as `http://127.0.0.1:54321/`; the port will vary. If the browser does not open automatically, copy that URL into a browser on the same computer.
 
-## Cara menjalankan scan
+Keep the terminal open while scans run. Press **Ctrl+C** in that terminal to stop the application safely. Running scans are marked interrupted when the app shuts down and do not resume automatically.
 
-1. Pada **Workspace proyek**, masukkan nama perusahaan/proyek dan klik **Buat proyek**, atau pilih proyek yang sudah ada. Satu proyek dapat berisi beberapa scan Cisco dan Palo Alto. Untuk scan perusahaan lain, buat atau pilih proyek lain; scan sebelumnya tetap berjalan.
-2. Pilih **Cisco Switch · IOS / IOS XE** atau **Palo Alto Firewall · PAN-OS**. Semua target dalam satu run harus menggunakan platform yang dipilih; jalankan platform berbeda dalam run terpisah.
-3. Pilih **Bulk · kredensial sama** untuk satu atau banyak perangkat dengan username/password yang sama. Masukkan satu IP per baris. Port opsional menggunakan format `IP,port`:
+### Pull the latest changes in an existing clone
 
-   ```text
-   192.0.2.10
-   192.0.2.11,2222
-   2001:db8::10,22
-   ```
+Open a terminal and run:
 
-   Contoh di atas adalah alamat dokumentasi. Port default `22`; IPv4 dan IPv6 tanpa scope ID didukung. Hostname tidak didukung.
-4. Untuk kredensial berbeda, pilih **Bulk · kredensial berbeda**, isi tabel, atau gunakan **Unduh template** dan **Impor CSV**. Formatnya harus berurutan `ip,port,username,password`; port kosong berarti `22`. Unduh contoh dari tombol di aplikasi atau dari [devices-sample.csv](examples/devices-sample.csv), lalu ganti semua nilai contoh:
+```bash
+cd /path/to/Automation-Access-control-
+git status --short
+git pull --ff-only origin main
+python3 start.py
+```
 
-   ```csv
-   ip,port,username,password
-   192.0.2.10,22,auditor1,CONTOH_PASSWORD_1
-   192.0.2.11,,auditor2,CONTOH_PASSWORD_2
-   ```
+Replace `/path/to/Automation-Access-control-` with the folder where you cloned the project. `--ff-only` avoids creating a merge commit. If Git says local changes would be overwritten, back up or commit those changes before pulling; do not discard work you need. If the clone tracks another branch, check it with `git branch --show-current` and use the matching branch name after `origin`.
 
-   Password CSV berupa plaintext. Batasi akses ke file, jangan commit ke Git, dan hapus sesuai kebijakan setelah digunakan. Maksimum 1 MB per CSV, 200 target per scan, tanpa batas jumlah scan aktif yang ditetapkan aplikasi, dan 5 koneksi SSH bersamaan secara keseluruhan. Jumlah scan yang dapat ditangani tetap bergantung pada kapasitas komputer dan penyimpanan. Target di atas batas koneksi menunggu dalam antrean. IP dan port yang sama tidak boleh duplikat.
-5. Untuk Cisco lawas yang memerlukannya, opsi **Kompatibilitas SSH lawas** dapat diaktifkan secara eksplisit. Opsi ini mengizinkan algoritma SSHv2 yang lebih lemah jika masih tersedia dalam library, berlaku untuk seluruh target dalam run, dan tidak menjamin dukungan semua perangkat lawas atau SSHv1. Gunakan hanya pada perangkat dan jaringan tepercaya sesuai kebijakan. Untuk Palo Alto opsi ini tidak tersedia.
-6. Klik **Mulai review**. Jika status `host_key_unknown`, cocokkan tipe dan fingerprint dengan sumber tepercaya; hanya jika cocok, klik **Saya sudah memverifikasi fingerprint ini**. Lalu jalankan kembali target yang memerlukan koneksi. Daftar di form dijalankan ulang seluruhnya, jadi ubah daftar jika hanya sebagian target perlu diulang. Host key yang disetujui pada UI berlaku selama proses aplikasi berjalan. Key yang berubah dari `known_hosts` diblokir dan perlu diselesaikan melalui prosedur organisasi.
-7. Tunggu hasil selesai. **Batalkan** menghentikan pekerjaan yang memungkinkan, melewati target dalam antrean dan menyediakan hasil parsial setelah worker selesai. Koneksi yang sedang menunggu dapat membutuhkan waktu hingga timeout. Satu autentikasi dilakukan per target per run; menjalankan ulang merupakan percobaan baru dan dapat memengaruhi lockout.
-8. Klik **Unduh Excel**. File `Access_Review_<ID>.xlsx` disimpan melalui browser. Nama proyek dan hasil yang sudah disaring disimpan otomatis di `.access-review-data/projects.json` agar tersedia kembali setelah restart. Host key yang disetujui pada UI tidak dipertahankan; scan yang masih berjalan saat aplikasi berhenti ditandai terhenti dan tidak dilanjutkan otomatis. Klik **Bersihkan kredensial** setelah selesai.
+To refresh the app after pulling, stop the old process with **Ctrl+C**, pull the changes, and run `python3 start.py` again. The launcher installs changed pinned dependencies when needed.
 
-### Live view dan beberapa scan
+### Manual virtual-environment setup (optional)
 
-Pada **Workspace proyek**, pilih proyek lalu pilih salah satu scan untuk melihat daftar IP dan statusnya. Klik sebuah perangkat untuk membuka preview bukti yang sudah disaring, command yang sedang berjalan, dan masalah yang terdeteksi. Preview diperbarui saat pengumpulan berlangsung, bukan tampilan terminal mentah. Scan aktif terbaru otomatis dibuka ketika proyek dipilih; scan lain tetap berjalan ketika Anda berpindah proyek atau scan. Input target, platform dan kredensial dibersihkan ketika berpindah proyek agar data antarperusahaan tidak tertukar. Tombol **Batalkan** dan **Unduh Excel** berlaku untuk scan yang sedang dipilih.
+Use this only if you want to inspect or run the application without the launcher:
 
-Status perangkat mencakup antre, menghubungkan SSH, SSH terhubung dan review berlangsung, selesai, hasil parsial, gagal, verifikasi host key, dibatalkan, serta terhenti akibat restart. `Selesai` tidak menjamin seluruh informasi akses tersedia. Persetujuan host key pada UI terpisah antarproyek; selalu cocokkan fingerprint sebelum menyetujui.
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python app.py
+```
 
-Data proyek disimpan di `.access-review-data/` pada direktori aplikasi dengan hak akses direktori `0700` dan file `0600` pada Linux/macOS. Data tersebut dapat memuat nama pengguna, IP dan konfigurasi yang disaring: lindungi direktori dan cadangannya sesuai kebijakan. Password, raw output, dan key SSH tidak disimpan dalam data proyek; fingerprint dan hasil yang telah disaring dapat tersimpan. Hanya satu instance aplikasi dapat memakai direktori data yang sama. Jika ada peringatan penyimpanan, hasil terbaru mungkin hilang. Penyimpanan diperbarui selama scan; storage yang lambat atau riwayat yang besar dapat menambah latensi. Direktori tersebut dikecualikan dari Git; jangan commit atau bagikan data proyek secara tidak sengaja.
+The launcher is the recommended entry point because it prepares the environment and performs startup checks.
 
-## Perintah dan cakupan pengumpulan
+## Create a project and run an audit
 
-| Platform | Perintah tetap | Informasi yang dicari |
+1. Enter a project name in the left sidebar and click **New project**. Select a project to open its dashboard. Projects keep their scan history separate.
+2. Click **New scan**, select **Cisco Switch · IOS / IOS XE** or **Palo Alto Firewall · PAN-OS**, and choose shared credentials or per-device credentials.
+3. Enter one IP address per line. An optional port can follow a comma, for example `192.0.2.10,2222`. The default port is `22`. IPv4 and IPv6 addresses are supported; hostnames are not. A scan accepts up to 200 unique IP/port targets.
+4. For per-device credentials, fill the table or import a CSV with the exact header `ip,port,username,password`. An empty port uses `22`. The CSV template contains placeholder credentials only. CSV passwords are plaintext; protect and delete the source file according to your policy.
+5. For a trusted legacy Cisco device only, you may enable **Legacy SSH compatibility**. It permits weaker SSHv2 algorithms when supported by the installed SSH library. Host key verification remains enabled. This option does not support SSHv1 and is unavailable for Palo Alto.
+6. Click **Start review**. If a device presents an unknown host key, verify the fingerprint using a trusted, separate source before approving it. A changed trusted key is blocked and must be resolved through your normal host-key process.
+7. The dashboard shows counts for **Total devices**, **In progress**, **Failed**, and **Done** for the selected scan. Select an IP to open its sanitized activity, current command, issues, and filtered evidence. The terminal-style panel is an activity preview, not an unrestricted raw terminal.
+8. Select **Download report** after the scan completes to download the `.xlsx` workbook. The report is a snapshot of collected and sanitized evidence. A completed scan does not mean all controls passed or that all accounts were discovered.
+
+At most five SSH connections run concurrently across all projects. Additional targets wait in a queue. Avoid repeated authentication attempts that could trigger account lockout.
+
+## What the audit collects
+
+Only fixed, read-only commands are sent. A command failure, unsupported output, insufficient privilege, or parser mismatch is recorded as a collection issue; the app does not fall back to arbitrary commands.
+
+### Cisco IOS / IOS XE
+
+The current command allowlist is:
+
+- `show version`, `show inventory`: device identity, model/version and available inventory identifiers.
+- `show privilege`: privilege level of the account used for this scan; it is not the level of every user.
+- `show ip ssh`: SSH enabled/disabled and version where available.
+- `show users`, `show ssh`: session commands are run, but their session output is intentionally not exported.
+- `show running-config`: a strict parser extracts visible local usernames and privilege, AAA authentication/authorization/accounting method lists, RADIUS/TACACS+ group/server references and safe server addresses/ports, selected VTY login/authorization/accounting/transport/access-class/timeout settings, and configured SSH version. Secret keys and unrecognized lines are omitted.
+
+The workbook can therefore show an example such as:
+
+| Check | Sanitized observation | Status |
 | --- | --- | --- |
-| Cisco IOS / IOS XE | `show version`, `show inventory`, `show privilege`, `show ip ssh`, `show users`, `show ssh`, `show running-config` | Identitas, akun lokal dan privilege, field AAA, VTY, access-class, status SSH, dan field manajemen yang berhasil diekstrak. Output sesi tidak diekspor. |
-| Palo Alto PAN-OS | `show system info`, `show admins all`, `show config running` | Identitas, administrator yang diketahui perangkat, serta field konfigurasi administrator dan password complexity yang berhasil diekstrak. |
+| Local accounts and privilege | `netops-ro — privilege: 5` | Observed |
+| AAA and method lists | `aaa authentication login default group RAD-AUTH local`; `aaa authorization exec default group TAC-GROUP local` | Observed |
+| VTY access and transport | `line vty 0 4 / login authentication default`; `line vty 0 4 / transport input ssh` | Observed |
+| MFA enforcement | External RADIUS/TACACS+ reference found; provider MFA policy was not checked | Not Available |
+| SSH status | `SSH Enabled - version 2.0` | Observed |
 
-Output konfigurasi lengkap dibaca sementara dalam memori, lalu disaring sebelum disimpan atau diekspor. Nilai secret dan hash tidak sengaja dimasukkan ke hasil. Jika format, privilege, ukuran output atau prompt tidak didukung, bagian yang gagal ditandai pada **Collection Issues**; tidak ada fallback ke mode konfigurasi atau perintah bebas. Pagination ditangani dengan spasi pada sesi SSH.
+This is illustrative output, not a recommendation that the sample configuration is compliant. A RADIUS/TACACS+ reference does **not** prove MFA is configured or enforced. External server policies, user membership, MFA prompts, effective command authorization, ACL definitions, and authentication success are outside this snapshot. Local usernames are accounts visible in the configuration, not a complete list of remote AAA users.
 
-`show admins all` bukan daftar sesi aktif dan tidak menjamin semua entitlement pada sistem identitas eksternal. PAN-OS XML dan bentuk output berbeda antar versi; konfigurasi yang tidak dapat diparse ditandai tidak tersedia. Pada Cisco, output `show running-config` dapat terbatas oleh privilege tanpa error. Field kosong tidak membuktikan akun, pengaturan, atau akses tidak ada. Definisi ACL lengkap, akun server AAA eksternal dan akses efektif tidak dicakup secara menyeluruh.
+### Palo Alto Networks PAN-OS
 
-## Hasil Excel
+The current command allowlist is:
 
-Workbook adalah snapshot dari data yang dapat dikumpulkan dan disanitasi pada waktu scan; bukan bukti otomatis bahwa kontrol memenuhi kebijakan organisasi. Waktu dicatat dalam UTC. File tidak terenkripsi dan berisi informasi sensitif; simpan di lokasi yang aksesnya dibatasi.
+- `show system info`: hostname, model, serial and PAN-OS version when recognized.
+- `show admins all`: administrator names known to the firewall. Vendor documentation says this can include local, remote, and Panorama-pushed administrators, whether or not they are currently logged in. It is not the active-session list.
+- `show config running`: a strict XML parser extracts local admin names and recognized role/profile references, safe password-complexity values, administrator authentication-profile references and methods when present, management permitted IPs, management service flags, idle timeout, and lockout settings. Password hashes, private keys, and unrecognized fields are not exported.
 
-| Sheet | Isi |
-| --- | --- |
-| **Run Summary** | Platform, ID run, waktu, profil SSH, jumlah target dan status koleksi. |
-| **Device Inventory** | Identitas yang berhasil diekstrak, IP, status perangkat dan keterbatasan. |
-| **Scan Results** | Hasil pemeriksaan berdasarkan data yang tersedia, nilai yang teramati, sumber command dan Evidence ID. |
-| **Accounts** | Akun/administrator dan privilege atau role yang berhasil diekstrak, dengan sumber bukti untuk akun dan role. |
-| **Access Configuration** | Field konfigurasi akses yang disanitasi beserta sumber dan batasannya. |
-| **Evidence** | Kutipan yang disanitasi, sumber command, timestamp dan ID bukti untuk penelusuran. |
-| **Collection Issues** | Command atau tahapan yang gagal dan dampak terhadap kelengkapan data. |
+An illustrative workbook excerpt could look like this:
 
-Di **Scan Results**, `Observed` berarti ada data yang berhasil diekstrak; `Attention` menunjukkan kondisi tertentu yang terlihat dan perlu perhatian; `Not Available` berarti informasi tidak dapat diekstrak. Status tersebut bukan kesimpulan Pass/Fail atau jaminan kelengkapan. `completed` pada perangkat berarti perintah selesai tanpa error yang terdeteksi, bukan semua akses berhasil diidentifikasi.
+| Check | Sanitized observation | Status |
+| --- | --- | --- |
+| Administrators known to the device | `admin`, `sec-auditor`, `panorama.ops` | Observed |
+| Administrators from configuration | `admin — superuser`; `sec-auditor — superreader` | Observed |
+| Administrator authentication | `sec-auditor — authentication-profile corp-radius`; `corp-radius — method radius` | Not Available |
+| MFA enforcement | External authentication is referenced; the provider's MFA policy and actual enforcement were not verified | Not Available |
+| Password complexity | `enabled yes`; `minimum-length 12` | Observed |
+| Management access | `permitted-ip 192.0.2.0/24`; `idle-timeout 30` | Observed |
 
-## Keamanan dan troubleshooting
+Names and values above are fictitious examples. `show admins all` can list remote or Panorama administrators whose individual role is not exposed by the local configuration; those roles remain `unknown` rather than being guessed. Profile references are clues for follow-up, not proof of effective access.
 
-- Kredensial diproses lokal dan tidak sengaja disimpan di konfigurasi, log atau workbook. CSV sumber, memori proses/browser dan workbook tetap harus dilindungi; Python tidak menjamin penghapusan memori sempurna. Jalankan hanya pada akun OS dan host yang dipercaya, karena proses lain pada host yang sama dapat mengakses UI lokal.
-- **Instalasi gagal:** periksa Python/venv, hak tulis direktori proyek dan akses package index atau konfigurasi wheel offline. Jalankan ulang `python3 start.py` setelah masalah diperbaiki.
-- **Browser tidak terbuka:** salin URL aktual dari terminal ke browser pada host yang sama.
-- **Host key berubah:** verifikasi melalui kanal tepercaya dan ikuti prosedur pembaruan `known_hosts`; jangan bypass verifikasi.
-- **Autentikasi gagal:** periksa kredensial dan AAA; hindari pengulangan yang dapat memicu lockout.
-- **Gagal atau parsial:** periksa platform, rute, port, SSH, privilege, kompatibilitas versi dan sheet **Collection Issues**. Ketiadaan data tidak boleh dianggap hasil aman.
+**MFA limitation:** the report distinguishes an observed external authentication path from verified MFA enforcement. The app cannot query the RADIUS/SAML provider or validate a second-factor challenge. Palo Alto documentation also notes that additional factors configured for authentication profiles are not supported for remote GlobalProtect or PAN-OS/Panorama administrator authentication; supported MFA integrations for those uses depend on RADIUS or SAML configuration. Verify the actual administrator-authentication path and provider-side policy independently. See the vendor documentation linked below.
 
-## Pengujian dan referensi
+## Excel report and status meanings
 
-Setelah dependensi terpasang, jalankan `.venv/bin/python -m unittest discover -s tests -v`. Sebelum penggunaan produksi, validasi alur penuh dengan akun read-only dan perangkat/lab yang diotorisasi pada model, versi, privilege dan format output yang digunakan organisasi, termasuk host key, autentikasi gagal, pagination, output parsial dan hasil Excel. Pengujian fixture tidak menggantikan pengujian perangkat nyata.
+The workbook contains:
 
-Dokumentasi vendor untuk memahami cakupan: [Palo Alto CLI device management](https://docs.paloaltonetworks.com/ngfw/pan-os-cli-quick-start/cli-cheat-sheet-device-management), [Palo Alto CLI administrator roles](https://docs.paloaltonetworks.com/ngfw/pan-os-cli-quick-start/get-started-with-the-cli/give-administrators-access-to-the-cli), dan [Cisco output running configuration untuk privilege rendah](https://www.cisco.com/c/en/us/support/docs/routers/asr-1000-series-aggregation-services-routers/212149-Configure-IOS-XE-to-display-full-show-ru.html).
+- **Run Summary** — project/run metadata, platform, target totals and device statuses.
+- **Device Inventory** — IP/port, platform, extracted identity, completion time, status, and completeness note.
+- **Scan Results** — access-control checks, sanitized observations, evidence links, status, and limitations.
+- **Accounts** — usernames and extracted privilege/role, with source command and evidence IDs.
+- **Access Configuration** — sanitized AAA, management, authentication-profile, password-complexity, and related settings.
+- **Evidence** — filtered command excerpts with device IDs and timestamps.
+- **Collection Issues** — failed or incomplete stages and their impact.
+
+`Observed` means a field was extracted; it is not a pass. `Attention` flags a condition that merits review; it is not necessarily a failure. `Not Available` means the app could not establish the requested fact from the collected evidence. Missing data must never be treated as proof that a user, restriction, or control does not exist.
+
+## Data handling and security
+
+- Credentials are used in memory for the scan and are not written to the workbook or project state. Clear form credentials after use.
+- Sanitized project and scan data are stored locally in `.access-review-data/` and can contain usernames, IP addresses, device identity and access configuration. Restrict access to this directory and any downloaded reports.
+- Raw command output is not saved as project state or exported. The live preview only renders filtered fields and safe activity events.
+- Excel files are not encrypted by this tool. Store them in an access-controlled location.
+- One app instance at a time can use the same project data directory. Do not commit `.access-review-data/`, credentials, populated CSVs, or generated reports.
+- Use only on devices and networks you are authorized to audit. Restrict the device account itself to the minimum read-only commands necessary.
+
+## Troubleshooting
+
+- **Dependencies fail to install:** check Python/`venv`, directory write access, and package-index connectivity. For an offline installation, have an administrator prepare a wheelhouse and configure pip for it before running the launcher.
+- **Browser did not open:** copy the `127.0.0.1` URL from the terminal into a browser on the same computer.
+- **SSH connection or authentication fails:** verify reachability, port, credentials, device AAA policy, and that the scan account is not locked. Avoid repeated retries.
+- **Host key verification required:** independently verify the fingerprint. Do not approve an unexpected key.
+- **Partial or missing fields:** check the workbook's **Collection Issues** sheet, device version, command support, privilege, and output format. Missing fields do not imply that a control is disabled.
+- **Update reports local changes would be overwritten:** inspect `git status --short`, back up or commit wanted changes, then retry the fast-forward pull.
+
+## Development and tests
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v
+node tests/test_ui.js
+```
+
+Fixture tests do not replace verification against authorized lab devices. Before production use, validate the device models, OS versions, output formats, privileges, host-key process, partial-output behavior, and report contents used by your organization.
+
+## Vendor references
+
+- [Palo Alto: CLI Cheat Sheet — Device Management](https://docs.paloaltonetworks.com/ngfw/pan-os-cli-quick-start/cli-cheat-sheet-device-management) — explains `show admins all` coverage.
+- [Palo Alto: Give Administrators Access to the CLI](https://docs.paloaltonetworks.com/ngfw/pan-os-cli-quick-start/get-started-with-the-cli/give-administrators-access-to-the-cli) — describes administrator role levels.
+- [Palo Alto: Authentication Profile](https://docs.paloaltonetworks.com/ngfw/help/10-1/device/device-authentication-profile/configure-an-authentication-profile) — describes the supported scope of additional factors.
+- [Palo Alto: Configure Multi-Factor Authentication](https://docs.paloaltonetworks.com/ngfw/administration/authentication/configure-multi-factor-authentication) — explains supported MFA integrations.
+- [Cisco: Authentication, Authorization, and Accounting Configuration Guide](https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/sec_usr_aaa/configuration/xe-16-9/sec-usr-aaa-xe-16-9-book.pdf) — Cisco IOS XE AAA concepts and method-list application.

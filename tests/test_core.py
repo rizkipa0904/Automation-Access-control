@@ -31,6 +31,25 @@ line vty 0 4
         self.assertIn('line vty 0 4 / transport input ssh', facts)
         self.assertEqual(accounts[0], {'username': 'admin', 'privilege': '15'})
 
+    def test_radius_and_tacacs_inventory_is_safe_and_secret_free(self):
+        config = '''aaa new-model
+aaa group server radius RAD-GROUP
+ server name RAD-1
+radius server RAD-1
+ address ipv4 192.0.2.20 auth-port 1812 acct-port 1813
+ key 7 DO_NOT_EXPORT
+tacacs server TAC-1
+ address ipv4 192.0.2.30
+ key SECRET
+'''
+        facts, _ = extract_config(config)
+        self.assertIn('aaa group server radius RAD-GROUP', facts)
+        self.assertIn('aaa group server radius RAD-GROUP / server name RAD-1', facts)
+        self.assertIn('radius server RAD-1 address ipv4 192.0.2.20 auth-port 1812 acct-port 1813', facts)
+        self.assertIn('tacacs server TAC-1 address ipv4 192.0.2.30', facts)
+        self.assertNotIn('DO_NOT_EXPORT', repr(facts))
+        self.assertNotIn('SECRET', repr(facts))
+
     def test_vty_context_and_aaa_method_lists_are_retained_without_unrecognized_values(self):
         config = """
             aaa new-model
@@ -209,6 +228,19 @@ admin@fw>'''
         self.assertEqual(accounts[1]['privilege'], 'custom:readonly')
         for secret in ('secret-hash', 'secret-key', 'secret-pass'):
             self.assertNotIn(secret, repr((facts, accounts)))
+
+    def test_admin_authentication_profiles_and_factor_references_are_extracted_safely(self):
+        from cisco_audit.core import extract_palo_config
+        xml = '''<config><mgt-config><users>
+        <entry name="audit-admin"><authentication-profile>corp-radius</authentication-profile><permissions><role-based><superreader>yes</superreader></role-based></permissions></entry>
+        </users><authentication-profile><entry name="corp-radius"><method><radius><server-profile>corp-radius-server</server-profile></radius></method><factors><enable>yes</enable><factor><entry name="duo-mfa"/></factor></factors></entry></authentication-profile></mgt-config></config>'''
+        facts, accounts = extract_palo_config(xml)
+        self.assertIn('admin audit-admin authentication-profile corp-radius', facts)
+        self.assertIn('authentication-profile corp-radius method radius', facts)
+        self.assertIn('authentication-profile corp-radius additional-factors-enabled yes', facts)
+        self.assertIn('authentication-profile corp-radius additional-factor-profile duo-mfa', facts)
+        self.assertNotIn('corp-radius-server', repr(facts))
+        self.assertEqual(accounts[0]['privilege'], 'superreader')
 
     def test_palo_management_settings_are_allowlisted(self):
         from cisco_audit.core import extract_palo_config
